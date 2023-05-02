@@ -1,0 +1,5 @@
+maxsteps: 200
+nproc: 4
+nblocks: 8
+vecFile: tornado.vec
+seedFile: seeds.txt
