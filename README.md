@@ -12,7 +12,16 @@ Run this first.
 python3 gen_random_seeds.py
 ```
 
-This creates the seed file and the required output folders such as `seeds/`, `drawSubdomain/`, `png/`, `streamlines/`, and `pathlines/`.
+The script accepts an optional seed count:
+
+```bash
+python3 gen_random_seeds.py 100
+python3 gen_random_seeds.py 10000
+```
+
+If no argument is given, it generates `10000` seeds by default.
+
+This creates `seeds/random_seeds.bin` and the required output folders such as `seeds/`, `drawSubdomain/`, `png/`, `streamlines/`, and `pathlines/`.
 
 ### 2. Select the machine configuration
 

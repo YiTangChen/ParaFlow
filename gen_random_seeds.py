@@ -8,6 +8,7 @@ Atlantic Ocean bounding box (approximate):
   Longitude: -80 to 20 degrees
 """
 
+import argparse
 import struct
 import math
 import random
@@ -34,10 +35,8 @@ LAT_MAX =  90.0
 LON_MIN = -180.0
 LON_MAX =  180.0
 
-N_SEEDS = 1000
-SEED_FILE = os.path.join(dst_dir, "random_seeds_1000.bin")
+DEFAULT_N_SEEDS = 10000
 
-random.seed(42)
 
 def latlon_to_xyz(lat_deg, lon_deg):
     lat = math.radians(lat_deg)
@@ -47,23 +46,48 @@ def latlon_to_xyz(lat_deg, lon_deg):
     z = EARTH_RADIUS_1 * math.sin(lat)
     return x, y, z
 
-with open(SEED_FILE, 'wb') as f:
-    count = 0
-    # Use rejection sampling on a uniform sphere within the bounding box.
-    # For uniform distribution on the sphere, sample sin(lat) uniformly.
-    sin_lat_min = math.sin(math.radians(LAT_MIN))
-    sin_lat_max = math.sin(math.radians(LAT_MAX))
 
-    while count < N_SEEDS:
-        # Uniform sampling on sphere surface within lat/lon box
-        sin_lat = random.uniform(sin_lat_min, sin_lat_max)
-        lat = math.degrees(math.asin(sin_lat))
-        lon = random.uniform(LON_MIN, LON_MAX)
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "n_seeds",
+        nargs="?",
+        type=int,
+        default=DEFAULT_N_SEEDS,
+        help=f"number of random seeds to generate (default: {DEFAULT_N_SEEDS})",
+    )
+    return parser.parse_args()
 
-        x, y, z = latlon_to_xyz(lat, lon)
-        f.write(struct.pack('ddd', x, y, z))
-        count += 1
 
-print(f"Generated {count} seeds in '{SEED_FILE}'")
-print(f"Lat range: [{LAT_MIN}, {LAT_MAX}], Lon range: [{LON_MIN}, {LON_MAX}]")
-print(f"Earth radius: {EARTH_RADIUS} m")
+def main():
+    args = parse_args()
+    if args.n_seeds <= 0:
+        raise ValueError("n_seeds must be a positive integer")
+
+    n_seeds = args.n_seeds
+    seed_file = os.path.join(dst_dir, f"random_seeds.bin")
+
+    random.seed(42)
+
+    with open(seed_file, "wb") as f:
+        count = 0
+        # For uniform distribution on the sphere, sample sin(lat) uniformly.
+        sin_lat_min = math.sin(math.radians(LAT_MIN))
+        sin_lat_max = math.sin(math.radians(LAT_MAX))
+
+        while count < n_seeds:
+            sin_lat = random.uniform(sin_lat_min, sin_lat_max)
+            lat = math.degrees(math.asin(sin_lat))
+            lon = random.uniform(LON_MIN, LON_MAX)
+
+            x, y, z = latlon_to_xyz(lat, lon)
+            f.write(struct.pack("ddd", x, y, z))
+            count += 1
+
+    print(f"Generated {count} seeds in '{seed_file}'")
+    print(f"Lat range: [{LAT_MIN}, {LAT_MAX}], Lon range: [{LON_MIN}, {LON_MAX}]")
+    print(f"Earth radius: {EARTH_RADIUS} m")
+
+
+if __name__ == "__main__":
+    main()

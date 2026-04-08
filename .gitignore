@@ -34,7 +34,7 @@ Thumbs.db
 /pathlines/
 /logs/
 /block_outputs/
-/seeds/random_seeds_1000.bin
+/seeds/
 
 # Generated figures
 *.png
