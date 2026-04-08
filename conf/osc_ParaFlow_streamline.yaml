@@ -1,0 +1,29 @@
+enable_timing: true
+outputDir: streamlines/testMem
+
+maxsteps: 1000000
+record_interval: 180
+dt: 20.0
+nproc: 32
+nblocks: 32
+meshfile_src: null
+datafile_src: /users/PCON0022/yang5039/data/mpas-o-velocities/output.nc
+graph_partition_indices: /users/PCON0022/yang5039/OceanProject/Partition_Preparation/data/nc2graph.info.part.32
+isBinarySeed: true
+seedFile: seeds/random_seeds_100.bin
+
+# time-varying variables
+isTimeVarying: false
+velocity:
+  cartesian:     # XYZ
+    X: null
+    Y: null
+    Z: null
+  spherical:    # zonal & meridional
+    zonal: velocityZonal
+    meridional: velocityMeridional
+  normal: null   # normal
+zTop: null
+layerThickness: layerThickness
+vertVelocityTop: vertVelocityTop
+xtime: xtime

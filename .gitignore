@@ -1,0 +1,51 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+**/.ipynb_checkpoints/
+**/*~
+
+# CMake / build artifacts
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+**/CTestTestfile.cmake
+**/DartConfiguration.tcl
+**/install_manifest.txt
+
+# Compiled libraries / objects
+*.o
+*.so
+*.so.*
+*.a
+
+# Top-level built executables
+/DrawSubdomain
+/ParaFlow_streamline
+/ParaFlow_pathline
+
+# Generated output directories
+/drawSubdomain/
+/png/
+/streamlines/
+/pathlines/
+/logs/
+/block_outputs/
+
+# Generated figures
+*.png
+*.pdf
+
+# Generated helper files from vendored dependencies
+/ParaFlow/yaml-cpp/yaml-cpp-config.cmake
+/ParaFlow/yaml-cpp/yaml-cpp-config-version.cmake
+/ParaFlow/yaml-cpp/yaml-cpp-targets.cmake
+/ParaFlow/diy/diy-config.cmake
+/ParaFlow/diy/diy-targets.cmake
+
+# Python cache
+__pycache__/
+*.pyc

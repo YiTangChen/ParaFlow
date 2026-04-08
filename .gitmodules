@@ -1,0 +1,3 @@
+[submodule "ParaFlow/diy"]
+	path = ParaFlow/diy
+	url = https://github.com/diatomic/diy.git

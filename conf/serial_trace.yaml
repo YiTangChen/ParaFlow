@@ -1,0 +1,22 @@
+maxsteps: 1000000
+interval: 100
+meshfile_src: null
+datafile_src: /fs/ess/PAS2402/data/mpas-o-velocities/new/output.nc
+isBinarySeed: true
+seedFile: seeds/random_seeds.bin
+integration_order: euler   # euler or rk4
+
+
+# time-varying variables
+velocity:
+  cartesian:
+    X: null
+    Y: null
+    Z: null
+  spherical:    # zonal & meridional
+    zonal: velocityZonal
+    meridional: velocityMeridional
+  normal: null   # normal
+zTop: null
+layerThickness: layerThickness
+vertVelocityTop: vertVelocityTop
