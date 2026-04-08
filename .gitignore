@@ -39,6 +39,7 @@ Thumbs.db
 # Generated figures
 *.png
 *.pdf
+*.log
 /nc2graph.info.part.*
 
 # Generated helper files from vendored dependencies
