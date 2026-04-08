@@ -94,3 +94,19 @@ If you want to plot streamlines instead, edit `plot_traces.sh`, uncomment the fi
 # python3 read_traces.py 256 pathlines
 python3 plot_traces.py pathlines/pathlines.bin drawSubdomain pathlines_map.png
 ```
+
+## Clone with submodules
+
+This repository uses `ParaFlow/diy` as a git submodule.
+
+When cloning the repository for the first time, use:
+
+```bash
+git clone --recurse-submodules git@github.com:YiTangChen/ParaFlow.git
+```
+
+If you already cloned the repository without submodules, run:
+
+```bash
+git submodule update --init --recursive
+```
