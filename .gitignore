@@ -34,10 +34,12 @@ Thumbs.db
 /pathlines/
 /logs/
 /block_outputs/
+/seeds/random_seeds_1000.bin
 
 # Generated figures
 *.png
 *.pdf
+/nc2graph.info.part.*
 
 # Generated helper files from vendored dependencies
 /ParaFlow/yaml-cpp/yaml-cpp-config.cmake

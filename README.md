@@ -4,7 +4,17 @@
 
 Run the following steps in order.
 
-### 1. Select the machine configuration
+### 1. Generate seeds and output folders
+
+Run this first.
+
+```bash
+python3 gen_random_seeds.py
+```
+
+This creates the seed file and the required output folders such as `seeds/`, `drawSubdomain/`, `png/`, `streamlines/`, and `pathlines/`.
+
+### 2. Select the machine configuration
 
 Run this once at the beginning, or anytime you switch machines.
 
@@ -19,49 +29,49 @@ This updates:
 - `ParaFlow/CMakeLists.txt`
 - `ParaFlow/OSUFlow/CMakeLists.txt`
 
-### 2. Clean old CMake files
+### 3. Clean old CMake files
 
 ```bash
 ./clean.sh
 ```
 
-### 3. Build everything
+### 4. Build everything
 
 ```bash
 ./build.sh
 ```
 
-### 4. Generate the subdomain output
+### 5. Generate the subdomain output
 
 ```bash
 srun -n 256 -N 12 --ntasks-per-node=24 --distribution=block:cyclic ./DrawSubdomain conf/osc_drawsubdomain.yaml
 ```
 
-### 5. Plot the subdomain
+### 6. Plot the subdomain
 
 ```bash
 python3 drawsubdomain.py
 ```
 
-After steps 1-5 are done, the project is ready for the trace runs below.
+After steps 1-6 are done, the project is ready for the trace runs below.
 
 ## Optional runs
 
 The following parts do not need to follow a strict global order.
 
-- `6` and `7` belong together for the streamline workflow.
-- `8` and `9` belong together for the pathline workflow.
+- `7` and `8` belong together for the streamline workflow.
+- `9` and `10` belong together for the pathline workflow.
 - You can run either workflow depending on what you want to generate.
 
 ## Streamline workflow
 
-### 6. Run streamline tracing
+### 7. Run streamline tracing
 
 ```bash
 srun -n 256 -N 12 --ntasks-per-node=24 --distribution=block:cyclic ./ParaFlow_streamline conf/osc_ParaFlow_streamline.yaml
 ```
 
-### 7. Plot streamline results
+### 8. Plot streamline results
 
 ```bash
 ./plot_traces.sh
@@ -69,13 +79,13 @@ srun -n 256 -N 12 --ntasks-per-node=24 --distribution=block:cyclic ./ParaFlow_st
 
 ## Pathline workflow
 
-### 8. Run pathline tracing
+### 9. Run pathline tracing
 
 ```bash
 srun -n 256 -N 12 --ntasks-per-node=24 --distribution=block:cyclic ./ParaFlow_pathline conf/osc_ParaFlow_pathline.yaml
 ```
 
-### 9. Plot pathline results
+### 10. Plot pathline results
 
 ```bash
 ./plot_traces.sh
