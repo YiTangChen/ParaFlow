@@ -63,7 +63,7 @@ void vtCPathLine::computePathLine(list<vtListTimeSeedTrace*>& listSeedTraces, li
 	{
 		vtListTimeSeedTrace *trace =  new vtListTimeSeedTrace;
 		vtParticleInfo* thisParticle = *pIter;
-		currentT = thisParticle->m_fStartTime; 
+		currentT = thisParticle->m_fCurrentTime;
 
 		if(thisParticle->itsValidFlag == 1)
 		{
@@ -113,7 +113,7 @@ void vtCPathLine::computePathLine(list<vtListTimeSeedTrace*>& listSeedTraces,
     {
         vtListTimeSeedTrace* trace = new vtListTimeSeedTrace;
         vtParticleInfo* thisParticle = *pIter;
-        double currentT = thisParticle->m_fStartTime;
+        double currentT = thisParticle->m_fCurrentTime;
 
         // Set spatial hint so MPASO_rk4 can start from the correct cell
         if (seedIdx < (int)fromCells.size())
@@ -168,7 +168,7 @@ void vtCPathLine::computePathLine(list<vtPathlineParticle*>& listSeedTraces)
 
 		if(thisParticle->itsValidFlag == 1)
 		{
-		  currentT = thisParticle->m_fStartTime; 
+		  currentT = thisParticle->m_fCurrentTime;
 		  finalT = currentT + m_timeDir * m_itsTimeInc;
 		  int res = advectParticle(m_integrationOrder, *thisParticle, currentT, *thisParticle, finalT);
 		  if(res == 1)

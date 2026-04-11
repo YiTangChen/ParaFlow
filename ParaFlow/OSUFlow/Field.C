@@ -110,7 +110,8 @@ bool CVectorField::isTimeVarying(void)
 int CVectorField::at_cell(int cellId,
 						  CellTopoType eCellTopoType,
 						  const double t,
-						  vector<VECTOR3>& vNodeData)
+						  vector<VECTOR3>& vNodeData,
+						  int* cachedLowT)
 {
 	VECTOR3 nodeData;
 	vector<int> vVerIds;
@@ -120,7 +121,7 @@ int CVectorField::at_cell(int cellId,
 	switch(eCellTopoType)
 	{
 	case T0_CELL:								// cellId is the node Id
-		if(m_pSolution->GetValue(cellId, t, nodeData) == -1)
+		if(m_pSolution->GetValue(cellId, t, nodeData, cachedLowT) == -1)
 			return -1;
 		vNodeData.push_back(nodeData);
 		break;
@@ -132,7 +133,7 @@ int CVectorField::at_cell(int cellId,
 
 		for(iFor = 0; iFor < 4; iFor++)
 		{
-			if(m_pSolution->GetValue(vVerIds[iFor], t, nodeData) == -1)
+			if(m_pSolution->GetValue(vVerIds[iFor], t, nodeData, cachedLowT) == -1)
 				return -1;
 			vNodeData.push_back(nodeData);
 		}
@@ -143,7 +144,7 @@ int CVectorField::at_cell(int cellId,
 
 		for(iFor = 0; iFor < (int)vVerIds.size(); iFor++)
 		{
-			if(m_pSolution->GetValue(vVerIds[iFor], t, nodeData) == -1)
+			if(m_pSolution->GetValue(vVerIds[iFor], t, nodeData, cachedLowT) == -1)
 				return -1;
 			vNodeData.push_back(nodeData);
 		}
@@ -156,7 +157,7 @@ int CVectorField::at_cell(int cellId,
 
 		for(iFor = 0; iFor < (int)vVerIds.size(); iFor++)
 		{
-			if(m_pSolution->GetValue(vVerIds[iFor], t, nodeData) == -1) {
+			if(m_pSolution->GetValue(vVerIds[iFor], t, nodeData, cachedLowT) == -1) {
 				// GetValue prints a diagnostic if the vertex id is truly out of range
 				return -1;
 			}
@@ -174,7 +175,8 @@ int CVectorField::at_cell(int cellId,
 int CVectorField::at_vertcell(int cellId,
 						  CellTopoType eCellTopoType,
 						  const double t,
-						  vector<VECTOR3>& vNodeData)
+						  vector<VECTOR3>& vNodeData,
+						  int* cachedLowT)
 {
 	VECTOR3 nodeData;
 	vector<int> vVerIds;
@@ -191,7 +193,7 @@ int CVectorField::at_vertcell(int cellId,
 
 		for(iFor = 0; iFor < (int)vVerIds.size(); iFor++)
 		{
-			if(m_vSolution->GetValue(vVerIds[iFor], t, nodeData) == -1) {
+			if(m_vSolution->GetValue(vVerIds[iFor], t, nodeData, cachedLowT) == -1) {
 				// GetValue prints a diagnostic if the vertex id is truly out of range
 				return -1;
 			}
@@ -219,7 +221,7 @@ int CVectorField::at_vertcell(int cellId,
 //		1:			operation successful
 //		-1:			operation fail
 //////////////////////////////////////////////////////////////////////////
-int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR3& vecData)
+int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR3& vecData, int* cachedLowT)
 {
 	vector<VECTOR3> vNodeData;
 	PointInfo pInfo;
@@ -231,13 +233,13 @@ int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR3& vecData)
 	// interpolate in the cell
 	if(m_pGrid->GetCellType() == VORONOI) {
 		// get vertex value at cell vertices
-		if(at_cell(pInfo.inCell, T5_CELL, t, vNodeData) == -1)
+		if(at_cell(pInfo.inCell, T5_CELL, t, vNodeData, cachedLowT) == -1)
 			return -1;
 		m_pGrid->interpolate(vecData, vNodeData, pInfo.MPASO_interpolant);
 	}
 	else {
 		// get vertex value at cell vertices
-		if(at_cell(pInfo.inCell, T3_CELL, t, vNodeData) == -1)
+		if(at_cell(pInfo.inCell, T3_CELL, t, vNodeData, cachedLowT) == -1)
 			return -1;
 		double coeff[3];
 		for(int i = 0; i < 3; i++) coeff[i] = pInfo.interpolant[i];
@@ -280,7 +282,8 @@ int CVectorField::at_phys_truelocal(VECTOR3 pos, double t, VECTOR3& vecData)
 int CVectorField::at_phys(const int fromCell, 
 			  VECTOR3& pos, 
 			  PointInfo& pInfo,
-			  const double t, VECTOR3& nodeData)
+			  const double t, VECTOR3& nodeData,
+			  int* cachedLowT)
 {
 	vector<VECTOR3> vNodeData;
 		
@@ -292,7 +295,7 @@ int CVectorField::at_phys(const int fromCell,
 	}
 	// MPAS Ocean
 	if(this->m_pGrid->GetCellType() == VORONOI) {
-		if(at_cell(pInfo.inCell, T5_CELL, t, vNodeData) == -1) {
+		if(at_cell(pInfo.inCell, T5_CELL, t, vNodeData, cachedLowT) == -1) {
 			std::cout << "not at_cell\n";
 			return -1;
 		}
@@ -301,11 +304,11 @@ int CVectorField::at_phys(const int fromCell,
 	}
 	else {
 		if(pos[2] == 1.0) {
-			if(at_cell(pInfo.inCell, T2_CELL, t, vNodeData) == -1)
+			if(at_cell(pInfo.inCell, T2_CELL, t, vNodeData, cachedLowT) == -1)
 				return -1;
 		}
 		else {
-			if(at_cell(pInfo.inCell, T3_CELL, t, vNodeData) == -1)
+			if(at_cell(pInfo.inCell, T3_CELL, t, vNodeData, cachedLowT) == -1)
 				return -1;
 		}
 		// interpolate in the cell
@@ -317,7 +320,7 @@ int CVectorField::at_phys(const int fromCell,
 }
 
 // only MPAS-Ocean use this
-int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR4& vecData)
+int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR4& vecData, int* cachedLowT)
 {
 	vector<VECTOR3> horizontalData;
 	vector<VECTOR3> verticalData;
@@ -331,9 +334,9 @@ int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR4& vecData)
 		return -1;
 	// interpolate in the cell
 	// get vertex value at cell vertices
-	if(at_cell(pInfo.inCell, T5_CELL, t, horizontalData) == -1)
+	if(at_cell(pInfo.inCell, T5_CELL, t, horizontalData, cachedLowT) == -1)
 		return -1;
-	if(at_vertcell(pInfo.inCell, T5_CELL, t, verticalData) == -1)
+	if(at_vertcell(pInfo.inCell, T5_CELL, t, verticalData, cachedLowT) == -1)
 		return -1;
 	m_pGrid->interpolate(horizontal_vec, horizontalData, pInfo.MPASO_interpolant);
 	m_pGrid->interpolate(vertical_vec, verticalData, pInfo.MPASO_interpolant);
@@ -348,7 +351,8 @@ int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR4& vecData)
 int CVectorField::at_phys(const int fromCell,
 			  VECTOR3& pos,
 			  PointInfo& pInfo,
-			  const double t, VECTOR4& nodeData)
+			  const double t, VECTOR4& nodeData,
+			  int* cachedLowT)
 {
 	// find the cell this position belongs to
 	pInfo.Set(pos, pInfo.interpolant, fromCell, -1);
@@ -369,11 +373,11 @@ int CVectorField::at_phys(const int fromCell,
 		return -1;
 	}
 	for(int i = 0; i < 2 * nVert; i++) {
-		if(m_pSolution->GetValue(vVerIds[i], t, horizontalData[i]) == -1) {
+		if(m_pSolution->GetValue(vVerIds[i], t, horizontalData[i], cachedLowT) == -1) {
 			// GetValue prints a diagnostic if the vertex id is truly out of range
 			return -1;
 		}
-		if(m_vSolution->GetValue(vVerIds[i], t, verticalData[i]) == -1) {
+		if(m_vSolution->GetValue(vVerIds[i], t, verticalData[i], cachedLowT) == -1) {
 			// GetValue prints a diagnostic if the vertex id is truly out of range
 			return -1;
 		}
