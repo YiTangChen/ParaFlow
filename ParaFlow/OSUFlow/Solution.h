@@ -32,7 +32,6 @@ private:
 	float m_fMaxMag;					// maximum magnitude
 	double m_MinT, m_MaxT;				// real-time bounds (seconds)
 	std::vector<double> m_timestamps;	// real timestamp for each loaded array slot
-	int m_cachedLowT;					// hint index for GetValue; -1 = uninitialized
 
 public:
 	// constructor
@@ -57,6 +56,7 @@ public:
 	void ComputeMinMaxValue(void);
 	bool isTimeVarying(void);
 	int GetValue(int id, double t, VECTOR3& nodeData);
+	int GetValue(int id, double t, VECTOR3& nodeData, int* cachedLowT);
 	void Normalize(bool bLocal);
 	void Scale(float scaleF);
 

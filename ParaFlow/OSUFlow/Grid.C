@@ -12,6 +12,7 @@
 
 #include "Grid.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #pragma warning(disable : 4251 4100 4244 4101)
@@ -273,7 +274,7 @@ bool RegularCartesianGrid::isInCell(PointInfo& pInfo, const int cellId)
 // pInfo.interpolant: interpolation coefficients
 // return:	returns 1 if successful; otherwise returns -1
 //////////////////////////////////////////////////////////////////////////
-int RegularCartesianGrid::phys_to_cell(PointInfo& pInfo)
+int RegularCartesianGrid::phys_to_cell(PointInfo& pInfo, double, int*)
 {
   if(!isInBBox(pInfo.phyCoord))
     return -1;
@@ -727,7 +728,7 @@ bool IrregularGrid::at_phys(VECTOR3& pos)
 		return false;
 
 	pInfo.Set(pos, pInfo.interpolant, -1, -1);
-	if(phys_to_cell(pInfo) == 1)
+	if(phys_to_cell(pInfo, 0.0, NULL) == 1)
 		return true;
 
 	return false;
@@ -938,7 +939,7 @@ int IrregularGrid::nextTetra(PointInfo& pInfo, int tetraId)
 // pInfo.interpolant: natural coordinate
 // return:	returns 1 if successful; otherwise returns -1
 //////////////////////////////////////////////////////////////////////////
-int IrregularGrid::phys_to_cell(PointInfo& pInfo)
+int IrregularGrid::phys_to_cell(PointInfo& pInfo, double, int*)
 {
 	int iFor, tetraInCheck, nextT;
 	bool bFind;
@@ -1152,7 +1153,12 @@ MPASOGrid::~MPASOGrid()
 {
 	delete[] this->cellCoord;
 	delete[] this->vertexCoord;
+	delete[] this->verticesOnCell;
+	delete[] this->cellsOnVertex;
+	delete[] this->cellsOnCell;
 	delete[] this->numVerticesOnCell;
+	delete[] this->maxLevelCell;
+	delete[] this->zTop;
 }
 
 bool MPASOGrid::at_vertex(int verIdx, VECTOR3& pos)
@@ -1176,9 +1182,12 @@ bool MPASOGrid::at_phys(VECTOR3& pos)
 int MPASOGrid::getCellVertices(int nodeId, CellTopoType cellType, vector<int>& vVertices)
 {
 	// nodeId is a local flat index (localCellIdx * nVertLevels + vLevel)
+	if (cellType != T5_CELL) return -1;
+	if (nodeId < 0 || this->nVertLevels <= 1) return -1;
 	int cellidx = nodeId / this->nVertLevels;
 	if (cellidx < 0 || cellidx >= this->nCells) return -1;
 	int vLevel = nodeId % this->nVertLevels;
+	if (vLevel < 0 || vLevel >= this->nVertLevels - 1) return -1;
 	int nVert = this->numVerticesOnCell[cellidx];
 	int offset = cellidx * this->nMaxEdges;
 
@@ -1200,9 +1209,11 @@ int MPASOGrid::getCellVertices(int nodeId, CellTopoType cellType, vector<int>& v
 int MPASOGrid::getCellVertices(int nodeId, CellTopoType cellType, int* vVertices)
 {
 	if (cellType != T5_CELL) return -1;
+	if (nodeId < 0 || this->nVertLevels <= 1) return -1;
 	int cellidx = nodeId / this->nVertLevels;
 	if (cellidx < 0 || cellidx >= this->nCells) return -1;
 	int vLevel = nodeId % this->nVertLevels;
+	if (vLevel < 0 || vLevel >= this->nVertLevels - 1) return -1;
 	int nVert = this->numVerticesOnCell[cellidx];
 	int offset = cellidx * this->nMaxEdges;
 	for(int i = 0; i < nVert; i++) {
@@ -1243,7 +1254,7 @@ void MPASOGrid::interpolate(VECTOR3& nodeData, VECTOR3* vData, int nV, double* c
 // 	return B;
 // }
 
-int MPASOGrid::phys_to_cell(PointInfo& pInfo)
+int MPASOGrid::phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT)
 {
 	VECTOR3 phys = pInfo.phyCoord;
 	VECTOR3 phys_ontop = phys;
@@ -1328,6 +1339,7 @@ int MPASOGrid::phys_to_cell(PointInfo& pInfo)
 	int cellOffset = nearest_cellIdx * this->nVertLevels;
 
 	constexpr int MAX_VERT_LEVELS = 120;
+	assert(this->nVertLevels <= MAX_VERT_LEVELS);
 	double currztop[MAX_VERT_LEVELS];
 	double Aj[MAX_EDGES], Bk[MAX_EDGES];
 	for(int j = 0; j < curr_nVertices; j++)
@@ -1343,8 +1355,8 @@ int MPASOGrid::phys_to_cell(PointInfo& pInfo)
 		omegas[(k+1)%curr_nVertices] = w;
 		omega_sum += w;
 	}
-	if (omega_sum == 0.0)
-		omega_sum = 1e-6;
+	if (std::abs(omega_sum) <= 1.0e-30)
+		return -1;
 	for(int i = 0; i < curr_nVertices; i++)
 		omegas[i] = omegas[i] / omega_sum;
 
@@ -1360,11 +1372,23 @@ int MPASOGrid::phys_to_cell(PointInfo& pInfo)
 	}
 
 	DBG("[DBG-F] computing zTop (nVertLevels=%d nLocalVertices=%d)\n", this->nVertLevels, this->nLocalVertices);
+	int lowT, highT;
+	double timeRatio;
+	if(this->getZTopTimeWindow(t, cachedLowT ? *cachedLowT : -1, lowT, highT, timeRatio) == -1)
+		return -1;
+	if(cachedLowT)
+		*cachedLowT = lowT;
+	const double* zTopLow = this->getZTopTimestep(lowT);
+	const double* zTopHigh = this->getZTopTimestep(highT);
 	for(int vl = 0; vl < this->nVertLevels; vl++)
 		currztop[vl] = 0.0;
 	for(int i = 0; i < curr_nVertices; i++) {
-		for(int vl = 0; vl < this->nVertLevels; vl++)
-			currztop[vl] += this->zTop[lvoffsets[i] + vl] * omegas[i];
+		for(int vl = 0; vl < this->nVertLevels; vl++) {
+			double z = zTopLow[lvoffsets[i] + vl];
+			if(highT != lowT)
+				z += (zTopHigh[lvoffsets[i] + vl] - z) * timeRatio;
+			currztop[vl] += z * omegas[i];
+		}
 	}
 
 	auto it = std::upper_bound(currztop, currztop + this->nVertLevels, depth, std::greater<double>());
@@ -1388,7 +1412,7 @@ int MPASOGrid::phys_to_cell(PointInfo& pInfo)
 	return 1;
 }
 
-int MPASOGrid::phys_to_truelocalcell(PointInfo& pInfo)
+int MPASOGrid::phys_to_truelocalcell(PointInfo& pInfo, double t, int* cachedLowT)
 {
 	VECTOR3 phys = pInfo.phyCoord;
 	VECTOR3 phys_ontop = phys;
@@ -1473,6 +1497,7 @@ int MPASOGrid::phys_to_truelocalcell(PointInfo& pInfo)
 	int cellOffset = nearest_cellIdx * this->nVertLevels;
 
 	constexpr int MAX_VERT_LEVELS = 120;
+	assert(this->nVertLevels <= MAX_VERT_LEVELS);
 	double currztop[MAX_VERT_LEVELS];
 	double Aj[MAX_EDGES], Bk[MAX_EDGES];
 	for(int j = 0; j < curr_nVertices; j++)
@@ -1488,8 +1513,8 @@ int MPASOGrid::phys_to_truelocalcell(PointInfo& pInfo)
 		omegas[(k+1)%curr_nVertices] = w;
 		omega_sum += w;
 	}
-	if (omega_sum == 0.0)
-		omega_sum = 1e-6;
+	if (std::abs(omega_sum) <= 1.0e-30)
+		return -1;
 	for(int i = 0; i < curr_nVertices; i++)
 		omegas[i] = omegas[i] / omega_sum;
 
@@ -1505,11 +1530,23 @@ int MPASOGrid::phys_to_truelocalcell(PointInfo& pInfo)
 	}
 
 	DBG("[DBG-F] computing zTop (nVertLevels=%d nLocalVertices=%d)\n", this->nVertLevels, this->nLocalVertices);
+	int lowT, highT;
+	double timeRatio;
+	if(this->getZTopTimeWindow(t, cachedLowT ? *cachedLowT : -1, lowT, highT, timeRatio) == -1)
+		return -1;
+	if(cachedLowT)
+		*cachedLowT = lowT;
+	const double* zTopLow = this->getZTopTimestep(lowT);
+	const double* zTopHigh = this->getZTopTimestep(highT);
 	for(int vl = 0; vl < this->nVertLevels; vl++)
 		currztop[vl] = 0.0;
 	for(int i = 0; i < curr_nVertices; i++) {
-		for(int vl = 0; vl < this->nVertLevels; vl++)
-			currztop[vl] += this->zTop[lvoffsets[i] + vl] * omegas[i];
+		for(int vl = 0; vl < this->nVertLevels; vl++) {
+			double z = zTopLow[lvoffsets[i] + vl];
+			if(highT != lowT)
+				z += (zTopHigh[lvoffsets[i] + vl] - z) * timeRatio;
+			currztop[vl] += z * omegas[i];
+		}
 	}
 
 	auto it = std::upper_bound(currztop, currztop + this->nVertLevels, depth, std::greater<double>());
@@ -1585,7 +1622,7 @@ double MPASOGrid::cellVolume(int cellId)
 
 bool MPASOGrid::isInCell(PointInfo& pInfo, const int cellId)
 {
-	int res = this->phys_to_cell(pInfo);
+	int res = this->phys_to_cell(pInfo, 0.0, NULL);
 	if(res == -1) return false;
 	return pInfo.inCell == cellId;
 }
@@ -1673,56 +1710,88 @@ void MPASOGrid::setMaxLevelCell(int* inMaxLevelCell)
 	       this->nCells * sizeof(int));
 }
 
-void MPASOGrid::setZTop(double *inZTop)
+void MPASOGrid::setZTop(double *inZTop, int nTimesteps)
 {
 	assert(this->nLocalVertices != 0);
 	assert(this->nVertLevels != 0);
-	this->zTop = new double[this->nLocalVertices * this->nVertLevels];
-	for(int i = 0; i < this->nLocalVertices * this->nVertLevels; i++)
+	assert(nTimesteps > 0);
+	size_t nValues = static_cast<size_t>(nTimesteps) * this->nLocalVertices * this->nVertLevels;
+	delete[] this->zTop;
+	this->zTop = new double[nValues];
+	for(size_t i = 0; i < nValues; i++)
 		this->zTop[i] = inZTop[i];
 }
 
-void MPASOGrid::setLayerThickness(double *inLayerThickness)
+void MPASOGrid::setZTopTimestamps(const std::vector<double>& timestamps)
 {
-	assert(this->nLocalVertices != 0);
-	assert(this->nVertLevels != 0);
-	this->layerThickness = new double[this->nLocalVertices * this->nVertLevels];
-	for(int i = 0; i < this->nLocalVertices * this->nVertLevels; i++)
-		this->layerThickness[i] = inLayerThickness[i];
+	assert(timestamps.empty() || static_cast<int>(timestamps.size()) == this->nTimestepsLoaded);
+	this->zTopTimestamps = timestamps;
 }
 
-void MPASOGrid::setZTopNext(double *inZTop)
-{
-	assert(this->nLocalVertices != 0);
-	assert(this->nVertLevels != 0);
-	this->zTopNext = new double[this->nLocalVertices * this->nVertLevels];
-	for(int i = 0; i < this->nLocalVertices * this->nVertLevels; i++)
-		this->zTopNext[i] = inZTop[i];
-}
-
-void MPASOGrid::setLayerThicknessNext(double *inLayerThickness)
-{
-	assert(this->nLocalVertices != 0);
-	assert(this->nVertLevels != 0);
-	this->layerThicknessNext = new double[this->nLocalVertices * this->nVertLevels];
-	for(int i = 0; i < this->nLocalVertices * this->nVertLevels; i++)
-		this->layerThicknessNext[i] = inLayerThickness[i];
-}
-
-void MPASOGrid::updateZTop_LT_Next(double* inZTop, double* inLayerThickness)
+const double* MPASOGrid::getZTopTimestep(int timestep) const
 {
 	assert(this->zTop != nullptr);
-	assert(this->layerThickness != nullptr);
-	assert(this->zTopNext != nullptr);
-	assert(this->layerThicknessNext != nullptr);
-	delete[] this->zTop;
-	delete[] this->layerThickness;
-	this->zTop = this->zTopNext;
-	this->layerThickness = this->layerThicknessNext;
-	this->zTopNext = nullptr;
-	this->layerThicknessNext = nullptr;
-	setZTopNext(inZTop);
-	setLayerThicknessNext(inLayerThickness);
+	assert(timestep >= 0 && timestep < this->nTimestepsLoaded);
+	size_t timestepSize = static_cast<size_t>(this->nLocalVertices) * this->nVertLevels;
+	return this->zTop + timestep * timestepSize;
+}
+
+int MPASOGrid::getZTopTimeWindow(double t, int cachedLowT,
+								 int& lowT, int& highT, double& ratio) const
+{
+	lowT = 0;
+	highT = 0;
+	ratio = 0.0;
+	if(this->nTimestepsLoaded <= 0)
+		return -1;
+
+	if(static_cast<int>(this->zTopTimestamps.size()) == this->nTimestepsLoaded) {
+		if(t < this->zTopTimestamps.front() || t > this->zTopTimestamps.back())
+			return -1;
+		if(this->nTimestepsLoaded == 1)
+			return 1;
+		if(t == this->zTopTimestamps.back()) {
+			lowT = this->nTimestepsLoaded - 2;
+			highT = this->nTimestepsLoaded - 1;
+			ratio = 1.0;
+			return 1;
+		}
+
+		if(cachedLowT >= 0 && cachedLowT < this->nTimestepsLoaded - 1 &&
+		   t >= this->zTopTimestamps[cachedLowT]) {
+			lowT = cachedLowT;
+			while(lowT + 1 < this->nTimestepsLoaded - 1 &&
+				  t >= this->zTopTimestamps[lowT + 1])
+				lowT++;
+		}
+		else {
+			lowT = static_cast<int>(std::upper_bound(this->zTopTimestamps.begin(),
+													 this->zTopTimestamps.end(), t)
+									- this->zTopTimestamps.begin()) - 1;
+			if(lowT < 0)
+				lowT = 0;
+		}
+		highT = lowT + 1;
+		double span = this->zTopTimestamps[highT] - this->zTopTimestamps[lowT];
+		ratio = (span != 0.0) ? (t - this->zTopTimestamps[lowT]) / span : 0.0;
+		return 1;
+	}
+
+	double adjusted_t = t;
+	if(adjusted_t < 0.0 || adjusted_t > static_cast<double>(this->nTimestepsLoaded - 1))
+		return -1;
+	if(this->nTimestepsLoaded == 1)
+		return 1;
+	if(adjusted_t == static_cast<double>(this->nTimestepsLoaded - 1)) {
+		lowT = this->nTimestepsLoaded - 2;
+		highT = this->nTimestepsLoaded - 1;
+		ratio = 1.0;
+		return 1;
+	}
+	lowT = static_cast<int>(floor(adjusted_t));
+	highT = lowT + 1;
+	ratio = adjusted_t - static_cast<double>(lowT);
+	return 1;
 }
 
 void MPASOGrid::dumpData(string &prefix){
@@ -1827,25 +1896,14 @@ void MPASOGrid::dumpData(string &prefix){
 		return;
 	}
 	zTopOutFile.write(reinterpret_cast<const char*>(&this->nLocalVertices), sizeof(int));
+	zTopOutFile.write(reinterpret_cast<const char*>(&this->nTimestepsLoaded), sizeof(int));
 	zTopOutFile.write(reinterpret_cast<const char*>(&this->nVertLevels), sizeof(int));
-	for(int i = 0; i < this->nLocalVertices * this->nVertLevels; i++) {
+	size_t nTimeVaryingValues = static_cast<size_t>(this->nTimestepsLoaded) * this->nLocalVertices * this->nVertLevels;
+	for(size_t i = 0; i < nTimeVaryingValues; i++) {
 		zTopOutFile.write(reinterpret_cast<const char*>(&this->zTop[i]), sizeof(double));
 	}
 	zTopOutFile.close();
 
-	// layerThickness
-	filename = prefix + "_LayerThickness.bin";
-	ofstream layerThicknessOutFile(filename, ios::binary);
-	if (!layerThicknessOutFile) {
-		cerr << "Error opening file: " << filename << endl;
-		return;
-	}
-	layerThicknessOutFile.write(reinterpret_cast<const char*>(&this->nLocalVertices), sizeof(int));
-	layerThicknessOutFile.write(reinterpret_cast<const char*>(&this->nVertLevels), sizeof(int));
-	for(int i = 0; i < this->nLocalVertices * this->nVertLevels; i++) {
-		layerThicknessOutFile.write(reinterpret_cast<const char*>(&this->layerThickness[i]), sizeof(double));
-	}
-	layerThicknessOutFile.close();
 }
 
 void MPASOGrid::Reset()
@@ -1861,9 +1919,7 @@ void MPASOGrid::Reset()
 
 	// Time-varying
 	this->zTop = NULL;
-	this->layerThickness = NULL;
-	this->zTopNext = NULL;
-	this->layerThicknessNext = NULL;
+	this->zTopTimestamps.clear();
 
 	// Parameters
     this->nCells = 0;

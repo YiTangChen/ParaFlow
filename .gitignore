@@ -36,11 +36,13 @@ Thumbs.db
 /results/
 /block_outputs/
 /seeds/
+/results/
 
 # Generated figures
 *.png
 *.pdf
 *.log
+*.csv
 /nc2graph.info.part.*
 
 # Generated helper files from vendored dependencies

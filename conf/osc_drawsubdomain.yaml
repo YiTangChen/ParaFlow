@@ -14,9 +14,9 @@ velocity:
     Y: null
     Z: null
   spherical:    # zonal & meridional
-    zonal: velocityZonal
-    meridional: velocityMeridional
-  normal: null   # normal
+    zonal: null
+    meridional: null
+  normal: normalVelocity   # normal
 zTop: null
 layerThickness: layerThickness
 vertVelocityTop: vertVelocityTop

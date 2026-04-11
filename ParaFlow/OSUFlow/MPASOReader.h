@@ -80,6 +80,7 @@ private:
     int* cellsOnCell;
     int* numVerticesOnCell;
     int* maxLevelCell;
+    double* bottomDepth;
     int* verticesOnEdge;
     int* edgesOnCell;
 
@@ -101,7 +102,6 @@ private:
     int nTimestepsInMem = 0;   // timesteps currently loaded for all time-varying arrays
     int timestepOffset  = 0;   // offset within the current file
     double* cellZTop;
-    double* cellLayerThickness;
     TimeVaryingDataConfig cfg;
     std::vector<double> m_fileTimestamps;  // real timestamps (seconds) across all files
 
@@ -129,6 +129,7 @@ public:
     void readCellOnCell();
     void readNumVertexOnCell();
     void readMaxLevelCell();
+    void readBottomDepth();
     void readVerticesOnEdge();
     void readEdgesOnCell();
 
@@ -160,9 +161,9 @@ private:
     void computeCellVelocity(double* normalVelocity, VECTOR3*& cellVelocity);
     void computeTimeVaryingVar(int localVertIdx,
                                VECTOR3* cellVelocity, double* cellVertVelocity,
-                               double* cellZTop, double* cellLayerThickness,
-                               VECTOR3*& pVelocity_tmp, VECTOR3*& vVelocity_tmp,
-                               double*& ztop_tmp, double*& layerThickness_tmp);
+                               double* cellZTop,
+                               VECTOR3* pVelocityOut, VECTOR3* vVelocityOut,
+                               double* ztopOut);
 };
 
 #endif 

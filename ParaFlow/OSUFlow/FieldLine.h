@@ -38,6 +38,8 @@ class vtParticleInfo
 public:
 	PointInfo m_pointInfo;		// basic information about this particle
 	double m_fStartTime;			// start time
+	double m_fCurrentTime;		// current time inside the active block
+	int m_cachedLowT;			// per-particle local time-interval hint; -1 = invalid
 	int itsValidFlag;			// whether this particle is valid or not
 	int itsNumStepsAlive;		// number of steps alive
 	int ptId;					// particle ID
@@ -45,12 +47,20 @@ public:
 public:
 	vtParticleInfo(void)
 	{
+		m_fStartTime = 0.0;
+		m_fCurrentTime = 0.0;
+		m_cachedLowT = -1;
+		itsValidFlag = 0;
+		itsNumStepsAlive = 0;
+		ptId = -1;
 	}
 
 	vtParticleInfo(vtParticleInfo* source)
 	{
 		m_pointInfo.Set(source->m_pointInfo);
 		m_fStartTime = source->m_fStartTime;
+		m_fCurrentTime = source->m_fCurrentTime;
+		m_cachedLowT = source->m_cachedLowT;
 		itsValidFlag = source->itsValidFlag;
 		itsNumStepsAlive = 0;
 		ptId = -1;
@@ -60,6 +70,8 @@ public:
 	{
 		m_pointInfo.Set(source.m_pointInfo);
 		m_fStartTime = source.m_fStartTime;
+		m_fCurrentTime = source.m_fCurrentTime;
+		m_cachedLowT = source.m_cachedLowT;
 		itsValidFlag = source.itsValidFlag;
 		ptId = source.ptId;
 		itsNumStepsAlive = 0;
@@ -125,10 +137,10 @@ public:
 protected:
 	void releaseSeedMemory(void);
 	int euler_cauchy(TIME_DIR, TIME_DEP,double*, double);
-	int runge_kutta4(TIME_DIR, TIME_DEP, PointInfo&, double*, double);
-	int runge_kutta2(TIME_DIR, TIME_DEP, PointInfo&, double*, double);
-	int  MPASO_euler(TIME_DIR, TIME_DEP, PointInfo&, double*, double);
-	int  MPASO_rk4(TIME_DIR, TIME_DEP, PointInfo&, double*, double);
+	int runge_kutta4(TIME_DIR, TIME_DEP, PointInfo&, double*, double, int* cachedLowT = NULL);
+	int runge_kutta2(TIME_DIR, TIME_DEP, PointInfo&, double*, double, int* cachedLowT = NULL);
+	int  MPASO_euler(TIME_DIR, TIME_DEP, PointInfo&, double*, double, int* cachedLowT = NULL);
+	int  MPASO_rk4(TIME_DIR, TIME_DEP, PointInfo&, double*, double, int* cachedLowT = NULL);
 	bool geodesic_step(TIME_DIR, VECTOR3, double, VECTOR3, double, double, VECTOR3&, double&);
 	int adapt_step(const VECTOR3& p2, const VECTOR3& p1, const VECTOR3& p0, double dt_estimate,double* dt);
 };
@@ -312,4 +324,3 @@ protected:
 };
 
 #endif
-

@@ -266,15 +266,20 @@ int vtCStreamLine::computeFieldLine( TIME_DIR time_dir,
 
 	// get the initial stepsize
 	// this is a bug I think ...
-	cell_volume = m_pField->volume_of_cell(seedInfo.inCell);
-	mag = vel.GetMag();
-// 		printf(" **** volume = %f mag = %f  ....", cell_volume, mag); 
-	if(fabs(mag) < 1.0e-6f)
-		dt_estimate = 1.0e-5f;
-	else
-		dt_estimate = pow(cell_volume, (double)0.3333333f) / mag;
+	if(m_pField->GetCellType() == VORONOI) {
+		dt = dt_estimate = m_fInitStepSize;
+	}
+	else {
+		cell_volume = m_pField->volume_of_cell(seedInfo.inCell);
+		mag = vel.GetMag();
+// 		printf(" **** volume = %f mag = %f  ....", cell_volume, mag);
+		if(fabs(mag) < 1.0e-6f)
+			dt_estimate = 1.0e-5f;
+		else
+			dt_estimate = pow(cell_volume, (double)0.3333333f) / mag;
 		dt = m_fInitStepSize * dt_estimate;
-		//	printf(" **** dt = %f  ....", dt); 
+	}
+			//	printf(" **** dt = %f  ....", dt);
 
 #ifdef DEBUG
 	fprintf(fDebugOut, "****************new particle*****************\n");
@@ -360,13 +365,18 @@ int vtCStreamLine::computeFieldLine( TIME_DIR time_dir,
 
 	// get the initial stepsize
 	// this is a bug I think ...
-	cell_volume = m_pField->volume_of_cell(seedInfo.inCell);
-	mag = vel.GetMag();
-	if(fabs(mag) < 1.0e-6f)
-		dt_estimate = 1.0e-5f;
-	else
-		dt_estimate = pow(cell_volume, (double)0.3333333f) / mag;
+	if(m_pField->GetCellType() == VORONOI) {
+		dt = dt_estimate = m_fInitStepSize;
+	}
+	else {
+		cell_volume = m_pField->volume_of_cell(seedInfo.inCell);
+		mag = vel.GetMag();
+		if(fabs(mag) < 1.0e-6f)
+			dt_estimate = 1.0e-5f;
+		else
+			dt_estimate = pow(cell_volume, (double)0.3333333f) / mag;
 		dt = m_fInitStepSize * dt_estimate;
+	}
 
 	// start to advect
 	while(count < m_nMaxsize)
@@ -454,10 +464,15 @@ int vtCStreamLine::executeInfiniteAdvection(TIME_DIR time_dir,
 	curTime = m_fCurrentTime;
 
 	// get the initial stepsize
-	cell_volume = m_pField->volume_of_cell(seedInfo.inCell);
-	mag = vel.GetMag();
-	dt_estimate = pow(cell_volume, (double)0.3333333f) / mag;
-	dt = m_fInitStepSize * dt_estimate;
+	if(m_pField->GetCellType() == VORONOI) {
+		dt = dt_estimate = m_fInitStepSize;
+	}
+	else {
+		cell_volume = m_pField->volume_of_cell(seedInfo.inCell);
+		mag = vel.GetMag();
+		dt_estimate = pow(cell_volume, (double)0.3333333f) / mag;
+		dt = m_fInitStepSize * dt_estimate;
+	}
 
 #ifdef DEBUG
 	fprintf(fDebugOut, "****************new particle*****************\n");

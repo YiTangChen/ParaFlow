@@ -959,7 +959,7 @@ int CurvilinearGrid::coordinates_at_vertex(VECTOR3 vertex, VECTOR3* dp)
 	*dp=m_pVertex[id].position;
 	return 1;
 }
-int CurvilinearGrid::phys_to_cell(PointInfo& pInfo)
+int CurvilinearGrid::phys_to_cell(PointInfo& pInfo, double, int*)
 {
 	//seed points
 	//VECTOR3 v;
