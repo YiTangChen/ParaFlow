@@ -71,11 +71,12 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 					    vtParticleInfo& finalPoint,
 					    double finalTime)
 {
-	int istat;
+	int istat = OKAY;
 	double curTime, dt;
 	PointInfo pt;
 
 	pt = initialPoint.m_pointInfo;
+	initialPoint.m_fCurrentTime = initialTime;
 
 	if(m_itsTimeAdaptionFlag == 1)
 		dt = (finalTime - initialTime) * 0.5;
@@ -87,15 +88,24 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 	while(curTime < finalTime)
 	{
 		if(int_order == SECOND)
-			istat = runge_kutta2(m_timeDir, UNSTEADY, pt, &curTime, dt);
+			istat = runge_kutta2(m_timeDir, UNSTEADY, pt, &curTime, dt, &initialPoint.m_cachedLowT);
 		else
-			istat = runge_kutta4(m_timeDir, UNSTEADY, pt, &curTime, dt);
+			istat = runge_kutta4(m_timeDir, UNSTEADY, pt, &curTime, dt, &initialPoint.m_cachedLowT);
 
 		if(istat != 1)
+		{
+			initialPoint.m_pointInfo = pt;
+			initialPoint.m_fCurrentTime = curTime;
 			return istat;
+		}
 	}
 
 	finalPoint.m_pointInfo = pt;
+	finalPoint.m_fStartTime = initialPoint.m_fStartTime;
+	finalPoint.m_fCurrentTime = curTime;
+	finalPoint.m_cachedLowT = initialPoint.m_cachedLowT;
+	finalPoint.itsValidFlag = initialPoint.itsValidFlag;
+	finalPoint.ptId = initialPoint.ptId;
 	return istat;
 }
 
@@ -118,11 +128,14 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 
 	// the first particle
 	seedInfo = initialPoint.m_pointInfo;
-	res = m_pField->at_phys(seedInfo.fromCell, seedInfo.phyCoord, seedInfo, initialTime, vel);
+	initialPoint.m_fCurrentTime = initialTime;
+	res = m_pField->at_phys(seedInfo.fromCell, seedInfo.phyCoord, seedInfo, initialTime, vel, &initialPoint.m_cachedLowT);
 	if(res == OUT_OF_BOUND){
+		initialPoint.m_pointInfo = seedInfo;
 		return OUT_OF_BOUND;
 	}
 	if((fabs(vel[0]) < m_fStationaryCutoff) && (fabs(vel[1]) < m_fStationaryCutoff) && (fabs(vel[2]) < m_fStationaryCutoff)) {
+	  initialPoint.m_pointInfo = seedInfo;
 	  return CRITICAL_POINT;
 	}
 
@@ -161,20 +174,24 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 		prevParticle = thisParticle;
 
 		if(int_order == SECOND)
-			istat = runge_kutta2(m_timeDir, UNSTEADY, thisParticle, &curTime, dt);
+			istat = runge_kutta2(m_timeDir, UNSTEADY, thisParticle, &curTime, dt, &initialPoint.m_cachedLowT);
 		else if(int_order == MPASO_FOURTH)
-			istat = MPASO_rk4(m_timeDir, UNSTEADY, thisParticle, &curTime, dt);
+			istat = MPASO_rk4(m_timeDir, UNSTEADY, thisParticle, &curTime, dt, &initialPoint.m_cachedLowT);
 		else
-			istat = runge_kutta4(m_timeDir, UNSTEADY, thisParticle, &curTime, dt);
+			istat = runge_kutta4(m_timeDir, UNSTEADY, thisParticle, &curTime, dt, &initialPoint.m_cachedLowT);
 
 		if(istat == OUT_OF_BOUND)  {			// out of boundary
-		  printf(" foul!  "); 
+		  printf(" foul!  ");
+			initialPoint.m_pointInfo = thisParticle;
+			initialPoint.m_fCurrentTime = curTime;
 			return OUT_OF_BOUND;
 		}
 
-		m_pField->at_phys(thisParticle.fromCell, thisParticle.phyCoord, thisParticle, curTime, vel);
+		m_pField->at_phys(thisParticle.fromCell, thisParticle.phyCoord, thisParticle, curTime, vel, &initialPoint.m_cachedLowT);
 		if((fabs(vel[0]) < m_fStationaryCutoff) && (fabs(vel[1]) < m_fStationaryCutoff) && (fabs(vel[2]) < m_fStationaryCutoff)) {
-		  printf("trap!! "); 
+		  printf("trap!! ");
+			initialPoint.m_pointInfo = thisParticle;
+			initialPoint.m_fCurrentTime = curTime;
 			return CRITICAL_POINT;			// arrives at a critical point
 		}
 			
@@ -186,7 +203,9 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 		}
 
 		if((curTime < m_pField->GetMinTimeStep()) || (curTime > (double)(m_pField->GetMaxTimeStep()))) {
-		  printf("out!  "); 
+		  printf("out!  ");
+			initialPoint.m_pointInfo = thisParticle;
+			initialPoint.m_fCurrentTime = curTime;
 			return -1;
 		}
 
@@ -196,6 +215,7 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 	}
 
 	initialPoint.m_pointInfo = thisParticle;
+	initialPoint.m_fCurrentTime = curTime;
 	return OKAY;
 }
 
@@ -219,15 +239,18 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 
 	// the first particle
 	seedInfo = initialPoint.m_pointInfo;
-	res = m_pField->at_phys(seedInfo.fromCell, seedInfo.phyCoord, seedInfo, initialTime, vel);
+	initialPoint.m_fCurrentTime = initialTime;
+	res = m_pField->at_phys(seedInfo.fromCell, seedInfo.phyCoord, seedInfo, initialTime, vel, &initialPoint.m_cachedLowT);
 	if(res == OUT_OF_BOUND)  {
 		initialPoint.m_pointInfo = seedInfo;
+		initialPoint.m_fCurrentTime = initialTime;
 		if (toCells) toCells->push_back(-1);
 		m_lastFieldLineStepCount = 0;
 		return OUT_OF_BOUND;
 	}
 	if((fabs(vel[0]) < m_fStationaryCutoff) && (fabs(vel[1]) < m_fStationaryCutoff) && (fabs(vel[2]) < m_fStationaryCutoff)) {
 		initialPoint.m_pointInfo = seedInfo;
+		initialPoint.m_fCurrentTime = initialTime;
 		if (toCells) toCells->push_back(-1);
 		m_lastFieldLineStepCount = 0;
 		return CRITICAL_POINT;
@@ -273,13 +296,13 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 		prevParticle = thisParticle;
 
 		if(int_order == SECOND)
-			istat = runge_kutta2(m_timeDir, UNSTEADY, thisParticle, &curTime, dt);
+			istat = runge_kutta2(m_timeDir, UNSTEADY, thisParticle, &curTime, dt, &initialPoint.m_cachedLowT);
 		else if(int_order == MPASO_EULER)
-			istat = MPASO_euler(m_timeDir, UNSTEADY, thisParticle, &curTime, dt);
+			istat = MPASO_euler(m_timeDir, UNSTEADY, thisParticle, &curTime, dt, &initialPoint.m_cachedLowT);
 		else if(int_order == MPASO_FOURTH)
-			istat = MPASO_rk4(m_timeDir, UNSTEADY, thisParticle, &curTime, dt);
+			istat = MPASO_rk4(m_timeDir, UNSTEADY, thisParticle, &curTime, dt, &initialPoint.m_cachedLowT);
 		else
-			istat = runge_kutta4(m_timeDir, UNSTEADY, thisParticle, &curTime, dt);
+			istat = runge_kutta4(m_timeDir, UNSTEADY, thisParticle, &curTime, dt, &initialPoint.m_cachedLowT);
 
 		stepCount++;
 		// Always store at spatial exit (re-injection needs this position + toCell)
@@ -296,12 +319,13 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 
 		if(istat == OUT_OF_BOUND) {			// out of spatial boundary
 			initialPoint.m_pointInfo = thisParticle;
+			initialPoint.m_fCurrentTime = curTime;
 			if (toCells) toCells->push_back(thisParticle.fromCell);
 			m_lastFieldLineStepCount = stepCount;
 			return OUT_OF_BOUND;
 		}
 
-		m_pField->at_phys(thisParticle.fromCell, thisParticle.phyCoord, thisParticle, curTime, vel);
+		m_pField->at_phys(thisParticle.fromCell, thisParticle.phyCoord, thisParticle, curTime, vel, &initialPoint.m_cachedLowT);
 		if((fabs(vel[0]) < m_fStationaryCutoff) && (fabs(vel[1]) < m_fStationaryCutoff) && (fabs(vel[2]) < m_fStationaryCutoff)) {
 			if (!lastStored) {
 				VECTOR4 *p = new VECTOR4;
@@ -310,6 +334,7 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 				seedTrace.push_back(p);
 			}
 			initialPoint.m_pointInfo = thisParticle;
+			initialPoint.m_fCurrentTime = curTime;
 			if (toCells) toCells->push_back(thisParticle.fromCell);
 			m_lastFieldLineStepCount = stepCount;
 			return CRITICAL_POINT;			// arrives at a critical point
@@ -323,6 +348,7 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 				seedTrace.push_back(p);
 			}
 			initialPoint.m_pointInfo = thisParticle;
+			initialPoint.m_fCurrentTime = curTime;
 			if (toCells) toCells->push_back(thisParticle.fromCell);
 			m_lastFieldLineStepCount = stepCount;
 			return OUT_OF_TIME;			// temporal boundary
@@ -338,6 +364,7 @@ int vtCTimeVaryingFieldLine::advectParticle(INTEG_ORD int_order,
 	}
 	m_lastFieldLineStepCount = stepCount;
 	initialPoint.m_pointInfo = thisParticle;
+	initialPoint.m_fCurrentTime = curTime;
 	return OKAY;
 }
 

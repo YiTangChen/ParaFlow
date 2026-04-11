@@ -45,15 +45,15 @@ public:
 	~CVectorField();
 
 	int lerp_phys_coord(int cellId, CellTopoType eCellTopoType, double* coeff, VECTOR3& pos);
-	int at_cell(int cellId, CellTopoType eCellTopoType, const double t, vector<VECTOR3>& vNodeData);
-	int at_vertcell(int cellId, CellTopoType eCellTopoType, const double t, vector<VECTOR3>& vNodeData);
+	int at_cell(int cellId, CellTopoType eCellTopoType, const double t, vector<VECTOR3>& vNodeData, int* cachedLowT = NULL);
+	int at_vertcell(int cellId, CellTopoType eCellTopoType, const double t, vector<VECTOR3>& vNodeData, int* cachedLowT = NULL);
 	int at_slice(int slice, SliceType eSliceType, const double t, vector<VECTOR3>&vSliceData);
 	int at_vert(const int i, const int j, const int k, const double t, VECTOR3& dataValue);
-	int at_phys(VECTOR3 pos, double t, VECTOR3& vecData);
+	int at_phys(VECTOR3 pos, double t, VECTOR3& vecData, int* cachedLowT = NULL);
 	int at_phys_truelocal(VECTOR3 pos, double t, VECTOR3& vecData);
-	int at_phys(const int fromCell, VECTOR3& pos, PointInfo& pInfo,const double t, VECTOR3& nodeData);
-	int at_phys(VECTOR3 pos, double t, VECTOR4& vecData);
-	int at_phys(const int fromCell, VECTOR3& pos, PointInfo& pInfo,const double t, VECTOR4& nodeData);
+	int at_phys(const int fromCell, VECTOR3& pos, PointInfo& pInfo,const double t, VECTOR3& nodeData, int* cachedLowT = NULL);
+	int at_phys(VECTOR3 pos, double t, VECTOR4& vecData, int* cachedLowT = NULL);
+	int at_phys(const int fromCell, VECTOR3& pos, PointInfo& pInfo,const double t, VECTOR4& nodeData, int* cachedLowT = NULL);
 	int at_comp(const int i, const int j, const int k, const double t, VECTOR3& dataValue);
 	double volume_of_cell(int cellId);
 	void NormalizeField(bool bLocal);

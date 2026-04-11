@@ -70,7 +70,8 @@ int vtCFieldLine::euler_cauchy(TIME_DIR, TIME_DEP,double*, double)
 //////////////////////////////////////////////////////////////////////////
 int vtCFieldLine::runge_kutta2(TIME_DIR time_dir, TIME_DEP time_dep, 
 							   PointInfo& ci, 
-							   double* t, double dt)
+							   double* t, double dt,
+							   int* cachedLowT)
 {
 	int istat = 0;
 
@@ -85,7 +86,8 @@ int vtCFieldLine::runge_kutta4(TIME_DIR time_dir,
 							   TIME_DEP time_dep, 
 							   PointInfo& ci, 
 							   double* t,			// initial time
-							   double dt)			// stepsize
+							   double dt,			// stepsize
+							   int* cachedLowT)
 {
 	int i, istat;
 	VECTOR3 pt0;
@@ -96,7 +98,7 @@ int vtCFieldLine::runge_kutta4(TIME_DIR time_dir,
 
 	pt = ci.phyCoord;
 	// 1st step of the Runge-Kutta scheme
-	istat = m_pField->at_phys(ci.fromCell, pt, ci, *t, vel);
+	istat = m_pField->at_phys(ci.fromCell, pt, ci, *t, vel, cachedLowT);
 	if ( istat != 1 )
 		return OUT_OF_BOUND;
 
@@ -112,7 +114,7 @@ int vtCFieldLine::runge_kutta4(TIME_DIR time_dir,
 	if ( time_dep  == UNSTEADY)
 		*t += (double)0.5*time_dir*dt;
 	
-	istat=m_pField->at_phys(fromCell, pt, ci, *t, vel);
+	istat=m_pField->at_phys(fromCell, pt, ci, *t, vel, cachedLowT);
 	if ( istat!= 1 )
 	{
 		ci.phyCoord = pt;
@@ -127,7 +129,7 @@ int vtCFieldLine::runge_kutta4(TIME_DIR time_dir,
 
 	// 3rd step of the Runge-Kutta scheme
 	fromCell = ci.inCell;
-	istat=m_pField->at_phys(fromCell, pt, ci, *t, vel);
+	istat=m_pField->at_phys(fromCell, pt, ci, *t, vel, cachedLowT);
 	if ( istat != 1 )
 	{
 		ci.phyCoord = pt;
@@ -145,7 +147,7 @@ int vtCFieldLine::runge_kutta4(TIME_DIR time_dir,
 		*t += (double)0.5*time_dir*dt;
 	
 	fromCell = ci.inCell;
-	istat=m_pField->at_phys(fromCell, pt, ci, *t, vel);
+	istat=m_pField->at_phys(fromCell, pt, ci, *t, vel, cachedLowT);
 	if ( istat != 1 )
 	{
 		ci.phyCoord = pt;
@@ -200,7 +202,8 @@ int vtCFieldLine::MPASO_euler(TIME_DIR time_dir,
 							   TIME_DEP time_dep, 
 							   PointInfo& ci, 
 							   double* t,			// initial time
-							   double dt)			// stepsize
+							   double dt,			// stepsize
+							   int* cachedLowT)
 {
 	int istat;
 	VECTOR4 vel;
@@ -212,7 +215,7 @@ int vtCFieldLine::MPASO_euler(TIME_DIR time_dir,
 	pt = ci.phyCoord;
 	// Euler
 	fromCell = ci.inCell;
-	istat = m_pField->at_phys(fromCell, pt, ci, *t, vel);
+	istat = m_pField->at_phys(fromCell, pt, ci, *t, vel, cachedLowT);
 	if ( istat != 1 )
 		return OUT_OF_BOUND;
 
@@ -245,7 +248,8 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 							   TIME_DEP time_dep,
 							   PointInfo& ci,
 							   double* t,
-							   double dt)
+							   double dt,
+							   int* cachedLowT)
 {
 	const double speedup = 100.0;
 	int istat;
@@ -257,7 +261,7 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 
 	// --- Stage 1: evaluate k1 at (pt0, t) and cap dt ---
 	PointInfo ci_tmp = ci;
-	istat = m_pField->at_phys(ci.inCell, pt0, ci_tmp, *t, vel);
+	istat = m_pField->at_phys(ci.inCell, pt0, ci_tmp, *t, vel, cachedLowT);
 	if (istat != 1) return OUT_OF_BOUND;
 
 	VECTOR3 k1_h(vel[0], vel[1], vel[2]);
@@ -269,7 +273,7 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 	if (!geodesic_step(time_dir, pt0, r0, k1_h, k1_v, 0.5 * dt, pt1, r1)) return OUT_OF_BOUND;
 	double t1 = (time_dep == UNSTEADY) ? *t + 0.5 * time_dir * dt : *t;
 	ci_tmp = ci; ci_tmp.phyCoord = pt1;
-	istat = m_pField->at_phys(cell0, pt1, ci_tmp, t1, vel);
+	istat = m_pField->at_phys(cell0, pt1, ci_tmp, t1, vel, cachedLowT);
 	if (istat != 1) { ci.phyCoord = pt1; return OUT_OF_BOUND; }
 	VECTOR3 k2_h(vel[0], vel[1], vel[2]);
 	double  k2_v = vel[3];
@@ -278,7 +282,7 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 	VECTOR3 pt2; double r2;
 	if (!geodesic_step(time_dir, pt0, r0, k2_h, k2_v, 0.5 * dt, pt2, r2)) return OUT_OF_BOUND;
 	ci_tmp = ci; ci_tmp.phyCoord = pt2;
-	istat = m_pField->at_phys(cell0, pt2, ci_tmp, t1, vel);
+	istat = m_pField->at_phys(cell0, pt2, ci_tmp, t1, vel, cachedLowT);
 	if (istat != 1) { ci.phyCoord = pt2; return OUT_OF_BOUND; }
 	VECTOR3 k3_h(vel[0], vel[1], vel[2]);
 	double  k3_v = vel[3];
@@ -288,7 +292,7 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 	if (!geodesic_step(time_dir, pt0, r0, k3_h, k3_v, dt, pt3, r3)) return OUT_OF_BOUND;
 	double t2 = (time_dep == UNSTEADY) ? *t + time_dir * dt : *t;
 	ci_tmp = ci; ci_tmp.phyCoord = pt3;
-	istat = m_pField->at_phys(cell0, pt3, ci_tmp, t2, vel);
+	istat = m_pField->at_phys(cell0, pt3, ci_tmp, t2, vel, cachedLowT);
 	if (istat != 1) { ci.phyCoord = pt3; return OUT_OF_BOUND; }
 	VECTOR3 k4_h(vel[0], vel[1], vel[2]);
 	double  k4_v = vel[3];
@@ -370,12 +374,14 @@ void vtCFieldLine::setSeedPoints(VECTOR3* points, int numPoints, double t,
 			vtParticleInfo* newParticle = new vtParticleInfo;
 			newParticle->m_pointInfo.phyCoord = points[i];
 			newParticle->m_fStartTime = t;
+			newParticle->m_fCurrentTime = t;
+			newParticle->m_cachedLowT = -1;
 			newParticle->ptId = i;
 
 			// query the field in order to get the starting
 			// cell interpolant for the seed point
 			// which was passed to us without any prior information
-			res = m_pField->at_phys(-1, points[i], newParticle->m_pointInfo, t, nodeData);
+			res = m_pField->at_phys(-1, points[i], newParticle->m_pointInfo, t, nodeData, &newParticle->m_cachedLowT);
 // 			newParticle->itsValidFlag =  (res == 1) ? 1 : 0 ;
 			newParticle->itsValidFlag =  1;
 			m_lSeeds.push_back( newParticle );
@@ -392,7 +398,9 @@ void vtCFieldLine::setSeedPoints(VECTOR3* points, int numPoints, double t,
 			// set the new location for this seed point
 			thisSeed->m_pointInfo.phyCoord = points[i];
 			thisSeed->m_fStartTime = t;
-			res = m_pField->at_phys(-1, points[i], thisSeed->m_pointInfo, t, nodeData);
+			thisSeed->m_fCurrentTime = t;
+			thisSeed->m_cachedLowT = -1;
+			res = m_pField->at_phys(-1, points[i], thisSeed->m_pointInfo, t, nodeData, &thisSeed->m_cachedLowT);
 			thisSeed->itsValidFlag =  (res == 1) ? 1 : 0 ;
 		}    
 	}
@@ -426,13 +434,15 @@ void vtCFieldLine::setSeedPoints(VECTOR3* points, int numPoints,
 
 			newParticle->m_pointInfo.phyCoord = points[i];
 			newParticle->m_fStartTime = t[i];
+			newParticle->m_fCurrentTime = t[i];
+			newParticle->m_cachedLowT = -1;
 			newParticle->ptId = i;
 
 			// query the field in order to get the starting
 			// cell interpolant for the seed point
 			// which was passed to us without any prior information
 
-			res = m_pField->at_phys(-1, points[i], newParticle->m_pointInfo, t[i], nodeData);
+			res = m_pField->at_phys(-1, points[i], newParticle->m_pointInfo, t[i], nodeData, &newParticle->m_cachedLowT);
 // 			newParticle->itsValidFlag =  (res == 1) ? 1 : 0 ;
 			newParticle->itsValidFlag =  1;
 			m_lSeeds.push_back( newParticle );
@@ -449,7 +459,9 @@ void vtCFieldLine::setSeedPoints(VECTOR3* points, int numPoints,
 			// set the new location for this seed point
 			thisSeed->m_pointInfo.phyCoord = points[i];
 			thisSeed->m_fStartTime = t[i];
-			res = m_pField->at_phys(-1, points[i], thisSeed->m_pointInfo, t[i], nodeData);
+			thisSeed->m_fCurrentTime = t[i];
+			thisSeed->m_cachedLowT = -1;
+			res = m_pField->at_phys(-1, points[i], thisSeed->m_pointInfo, t[i], nodeData, &thisSeed->m_cachedLowT);
 			thisSeed->itsValidFlag =  (res == 1) ? 1 : 0 ;
 		}    
 	}
@@ -489,16 +501,18 @@ void vtCFieldLine::setSeedPoints(VECTOR4* points, int numPoints,
 		{
 			vtParticleInfo* newParticle = new vtParticleInfo;
 
-			VECTOR3 pos(points[i][0], points[i][1], points[i][2]); 
+			VECTOR3 pos(points[i][0], points[i][1], points[i][2]);
 			newParticle->m_pointInfo.phyCoord = pos;
-			newParticle->m_fStartTime = points[i][3]; 
+			newParticle->m_fStartTime = points[i][3];
+			newParticle->m_fCurrentTime = points[i][3];
+			newParticle->m_cachedLowT = -1;
 			newParticle->ptId = i;
 
 			// query the field in order to get the starting
 			// cell interpolant for the seed point
 			// which was passed to us without any prior information
 
-			res = m_pField->at_phys(-1, pos, newParticle->m_pointInfo, points[i][3], nodeData);
+			res = m_pField->at_phys(-1, pos, newParticle->m_pointInfo, points[i][3], nodeData, &newParticle->m_cachedLowT);
 // 			newParticle->itsValidFlag =  (res == 1) ? 1 : 0 ;
 			newParticle->itsValidFlag =  1;
 			m_lSeeds.push_back( newParticle );
@@ -516,7 +530,9 @@ void vtCFieldLine::setSeedPoints(VECTOR4* points, int numPoints,
 			// set the new location for this seed point
 			thisSeed->m_pointInfo.phyCoord = pos;
 			thisSeed->m_fStartTime = points[i][3];
-			res = m_pField->at_phys(-1, pos, thisSeed->m_pointInfo, points[i][3], nodeData);
+			thisSeed->m_fCurrentTime = points[i][3];
+			thisSeed->m_cachedLowT = -1;
+			res = m_pField->at_phys(-1, pos, thisSeed->m_pointInfo, points[i][3], nodeData, &thisSeed->m_cachedLowT);
 			thisSeed->itsValidFlag =  (res == 1) ? 1 : 0 ;
 		}    
 	}

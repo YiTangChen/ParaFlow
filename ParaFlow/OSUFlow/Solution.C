@@ -38,7 +38,6 @@ Solution::Solution(VECTOR3** pData, int nodeNum, int timeSteps)
 	m_nNodeNum = nodeNum;
 	m_nTimeSteps = timeSteps;
 	m_MinT = 0; m_MaxT = timeSteps-1;
-	m_cachedLowT = -1;
 	m_pDataArray = new VECTOR3*[timeSteps];
 
 	for(int iFor = 0; iFor < timeSteps; iFor++)
@@ -58,7 +57,6 @@ Solution::Solution(VECTOR3** pData, int nodeNum, int timeSteps, int min_t,
 	m_nNodeNum = nodeNum;
 	m_nTimeSteps = timeSteps;
 	m_MinT = min_t; m_MaxT = max_t;
-	m_cachedLowT = -1;
 	m_pDataArray = new VECTOR3*[timeSteps];
 
 	for(int iFor = 0; iFor < timeSteps; iFor++)
@@ -76,7 +74,6 @@ Solution::Solution(int nodeNum, int timeSteps)
 	m_nNodeNum = nodeNum;
 	m_nTimeSteps = timeSteps;
 	m_MinT = 0; m_MaxT = timeSteps-1;
-	m_cachedLowT = -1;
 	m_pDataArray = new VECTOR3*[timeSteps];
 
 	for(int iFor = 0; iFor < timeSteps; iFor++)
@@ -101,7 +98,6 @@ void Solution::Reset()
 	m_nNodeNum = 0;
 	m_nTimeSteps = 1;
 	m_MinT = 0; m_MaxT = 0;
-	m_cachedLowT = -1;
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -141,6 +137,11 @@ bool Solution::isTimeVarying(void)
 //////////////////////////////////////////////////////////////////////////
 int Solution::GetValue(int id, double t, VECTOR3& nodeData)
 {
+	return GetValue(id, t, nodeData, NULL);
+}
+
+int Solution::GetValue(int id, double t, VECTOR3& nodeData, int* cachedLowT)
+{
 	if ((id < 0) || (id >= m_nNodeNum)) {
 		std::cerr << "[Solution::GetValue] vertex id " << id << " out of range [0, " << m_nNodeNum << ")\n";
 		return -1;
@@ -162,21 +163,22 @@ int Solution::GetValue(int id, double t, VECTOR3& nodeData)
 			return -1;
 
 		// Find lowT such that timestamps[lowT] <= t < timestamps[lowT+1].
-		// Use cached hint when t is monotonically advancing (common case: sequential integration).
-		// Fall back to binary search if t went backward (e.g. new particle starting from t=0).
+		// Use a caller-owned hint when available; otherwise use binary search.
 		int lowT;
-		if (m_cachedLowT >= 0 && t >= m_timestamps[m_cachedLowT]) {
-			// Walk forward from cache — typically 0 or 1 steps
-			lowT = m_cachedLowT;
+		if (cachedLowT != NULL &&
+		    *cachedLowT >= 0 &&
+		    *cachedLowT < m_nTimeSteps - 1 &&
+		    t >= m_timestamps[*cachedLowT]) {
+			lowT = *cachedLowT;
 			while (lowT + 1 < m_nTimeSteps - 1 && t >= m_timestamps[lowT + 1])
 				lowT++;
 		} else {
-			// t went backward: fall back to binary search
 			lowT = (int)(std::upper_bound(m_timestamps.begin(), m_timestamps.end(), t)
 			             - m_timestamps.begin()) - 1;
 			if (lowT < 0) lowT = 0;
 		}
-		m_cachedLowT = lowT;
+		if (cachedLowT != NULL)
+			*cachedLowT = lowT;
 
 		int highT = lowT + 1;
 
