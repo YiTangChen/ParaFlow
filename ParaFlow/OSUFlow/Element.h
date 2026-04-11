@@ -59,6 +59,9 @@ typedef struct PointInfo
 		interpolant = pInfo.interpolant;
 		fromCell = pInfo.fromCell;
 		inCell = pInfo.inCell;
+		for(int i = 0; i < MPASO_MAX_EDGES + 1; i++)
+			MPASO_interpolant[i] = pInfo.MPASO_interpolant[i];
+		nVertices = pInfo.nVertices;
 	};
 }PointInfo;
 

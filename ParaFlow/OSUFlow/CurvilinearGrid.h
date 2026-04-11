@@ -74,7 +74,7 @@ public:
 	// get vertex list of a cell
 	int getCellVertices(int cellId, CellTopoType cellType, vector<int>& vVertices);
 	// get the cell id and also interpolating coefficients for the given physical position
-	int phys_to_cell(PointInfo& pInfo);
+	int phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT);
 	// the volume of cell
 	double cellVolume(int cellId);
 	// cell type

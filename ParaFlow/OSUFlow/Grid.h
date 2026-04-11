@@ -64,7 +64,7 @@ public:
 	// get vertex list of a cell
 	virtual int getCellVertices(int cellId, CellTopoType cellType, vector<int>& vVertices) = 0;
 	// get the cell id and also interpolating coefficients for the given physical position
-	virtual int phys_to_cell(PointInfo& pInfo) = 0;
+	virtual int phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT) = 0;
 	// interpolation
 	virtual void interpolate(VECTOR3& nodeData, vector<VECTOR3>& vData, double* coeff) = 0;
 	// the volume of cell
@@ -115,7 +115,7 @@ public:
 	// get vertex list of a cell
 	virtual int getCellVertices(int cellId, CellTopoType cellType, vector<int>& vVertices) =0; 
 	// get the cell id and also interpolating coefficients for the given physical position
-	virtual int phys_to_cell(PointInfo& pInfo) =0; 
+	virtual int phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT) =0;
 	
 	// interpolation
 	virtual void interpolate(VECTOR3& nodeData, vector<VECTOR3>& vData, double* coeff) =0; 
@@ -179,7 +179,7 @@ public:
 	// get vertex list of a cell
 	int getCellVertices(int cellId, CellTopoType cellType, vector<int>& vVertices);
 	// get the cell id and also interpolating coefficients for the given physical position
-	int phys_to_cell(PointInfo& pInfo);
+	int phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT);
 	// interpolation
 	  void interpolate(VECTOR3& nodeData, vector<VECTOR3>& vData, double* coeff); 
 	// the volume of cell
@@ -277,7 +277,7 @@ public:
 	bool at_vertex(int verIdx, VECTOR3& pos);
 	bool at_phys(VECTOR3& pos);
 	int getCellVertices(int cellId, CellTopoType cellType, vector<int>& vVertices);
-	int phys_to_cell(PointInfo& pInfo);
+	int phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT);
 	void interpolate(VECTOR3& nodeData, vector<VECTOR3>& vData, double* coeff);
 	double cellVolume(int cellId);
 	bool isInCell(PointInfo& pInfo, const int cellId);
@@ -323,9 +323,7 @@ private:
     int* maxLevelCell;
 	// Time-varying
 	double* zTop;
-	double* layerThickness;
-	double* zTopNext;
-	double* layerThicknessNext;
+	std::vector<double> zTopTimestamps;
 
 	// Parameters
 	int nCells;
@@ -358,8 +356,8 @@ public:
 	// Stack-array overload: avoids heap allocation on hot path. Returns nVert or -1.
 	int getCellVertices(int nodeId, CellTopoType cellType, int* vVertices);
 	// get cellId for pInfo.phyCoord
-	int phys_to_cell(PointInfo& pInfo);
-	int phys_to_truelocalcell(PointInfo& pInfo);
+	int phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT);
+	int phys_to_truelocalcell(PointInfo& pInfo, double t, int* cachedLowT);
 	void interpolate(VECTOR3& nodeData, vector<VECTOR3>& vData, double* coeff);
 	// Stack-array overload: avoids heap allocation on hot path.
 	void interpolate(VECTOR3& nodeData, VECTOR3* vData, int nV, double* coeff);
@@ -386,11 +384,9 @@ public:
 	void setNumVertexOnCell(int* inNumVerticesOnCell);
 	void setMaxLevelCell(int* inMaxLevelCell);
 
-	void setZTop(double* inZTop);
-	void setLayerThickness(double* inLayerThickness);
-	void setZTopNext(double* inZTop);
-	void setLayerThicknessNext(double* inLayerThickness);
-	void updateZTop_LT_Next(double* inZTop, double* inLayerThickness);
+	void setZTop(double* inZTop, int nTimesteps = 1);
+	void setZTopTimestamps(const std::vector<double>& timestamps);
+	const double* getZTopTimestep(int timestep) const;
 
 	// set and get parameters
 	void setNumCell(int numOfCell) { this->nCells = numOfCell; }
@@ -426,8 +422,7 @@ public:
 		b += (size_t)nCells         * nMaxEdges * sizeof(int);  // cellsOnCell
 		b += (size_t)nCells         * sizeof(int);              // numVerticesOnCell
 		b += (size_t)nCells         * sizeof(int);              // maxLevelCell
-		// zTop, layerThickness, zTopNext, layerThicknessNext
-		b += (size_t)nCells * nVertLevels * sizeof(double) * 4;
+		b += (size_t)nTimestepsLoaded * nLocalVertices * nVertLevels * sizeof(double);  // zTop
 		return b;
 	}
 
@@ -443,6 +438,7 @@ public:
 
 protected:
 	void Reset();
+	int getZTopTimeWindow(double t, int cachedLowT, int& lowT, int& highT, double& ratio) const;
 	// compute bounding box
 	void ComputeBBox(void);
 	// whether the point is in the bounding box

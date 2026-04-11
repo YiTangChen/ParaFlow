@@ -228,7 +228,7 @@ int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR3& vecData, int* cachedLo
 
 	// find the cell this position belongs to
 	pInfo.Set(pos, pInfo.interpolant, -1, -1);
-	if(m_pGrid->phys_to_cell(pInfo) == -1)
+	if(m_pGrid->phys_to_cell(pInfo, t, cachedLowT) == -1)
 		return -1;
 	// interpolate in the cell
 	if(m_pGrid->GetCellType() == VORONOI) {
@@ -257,7 +257,7 @@ int CVectorField::at_phys_truelocal(VECTOR3 pos, double t, VECTOR3& vecData)
 
 	// find the cell this position belongs to
 	pInfo.Set(pos, pInfo.interpolant, -1, -1);
-	if(static_cast<MPASOGrid*>(m_pGrid)->phys_to_truelocalcell(pInfo) == -1)
+	if(static_cast<MPASOGrid*>(m_pGrid)->phys_to_truelocalcell(pInfo, t, NULL) == -1)
 		return -1;
 	// interpolate in the cell
 	if(m_pGrid->GetCellType() == VORONOI) {
@@ -289,7 +289,7 @@ int CVectorField::at_phys(const int fromCell,
 		
 	// find the cell this position belongs to
 	pInfo.Set(pos, pInfo.interpolant, fromCell, -1);
-	if(m_pGrid->phys_to_cell(pInfo) == -1) {
+	if(m_pGrid->phys_to_cell(pInfo, t, cachedLowT) == -1) {
 		// std::cout << "cannot map coordinate to cell\n";
 		return -1;
 	}
@@ -330,7 +330,7 @@ int CVectorField::at_phys(VECTOR3 pos, double t, VECTOR4& vecData, int* cachedLo
 
 	// find the cell this position belongs to
 	pInfo.Set(pos, pInfo.interpolant, -1, -1);
-	if(m_pGrid->phys_to_cell(pInfo) == -1)
+	if(m_pGrid->phys_to_cell(pInfo, t, cachedLowT) == -1)
 		return -1;
 	// interpolate in the cell
 	// get vertex value at cell vertices
@@ -356,7 +356,7 @@ int CVectorField::at_phys(const int fromCell,
 {
 	// find the cell this position belongs to
 	pInfo.Set(pos, pInfo.interpolant, fromCell, -1);
-	if(m_pGrid->phys_to_cell(pInfo) == -1)
+	if(m_pGrid->phys_to_cell(pInfo, t, cachedLowT) == -1)
 		return -1;
 
 	// Use stack arrays to avoid heap allocation on this hot path.
@@ -396,7 +396,7 @@ int CVectorField::at_phys(const int fromCell,
 int CVectorField::resolve_cell(int fromCell, VECTOR3& pos, PointInfo& pInfo)
 {
 	pInfo.Set(pos, pInfo.interpolant, fromCell, -1);
-	return m_pGrid->phys_to_cell(pInfo);
+	return m_pGrid->phys_to_cell(pInfo, 0.0, NULL);
 }
 
 //////////////////////////////////////////////////////////////////////////
