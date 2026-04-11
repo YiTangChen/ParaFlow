@@ -162,8 +162,8 @@ private:
     void computeTimeVaryingVar(int localVertIdx,
                                VECTOR3* cellVelocity, double* cellVertVelocity,
                                double* cellZTop,
-                               VECTOR3*& pVelocity_tmp, VECTOR3*& vVelocity_tmp,
-                               double*& ztop_tmp);
+                               VECTOR3* pVelocityOut, VECTOR3* vVelocityOut,
+                               double* ztopOut);
 };
 
 #endif 

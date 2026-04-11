@@ -1,4 +1,5 @@
 #include "MPASOReader.h"
+#include <cmath>
 #include <cstring>
 
 MPASOReader::MPASOReader(const char* infile)
@@ -522,28 +523,14 @@ void MPASOReader::InitSolutions(MPASOGrid* grid, Solution* &pSolution, Solution*
             std::cerr << "[MPASOReader::InitSolutions] Error: cfg.velocity is not properly set." << std::endl;
         this->readVertVelocityTop(ts, 1);
 
-        int idx = 0;
         size_t gridBase = static_cast<size_t>(ts) * nVertNodes;
         for (int localVertIdx = 0; localVertIdx < this->nLocalVertices; localVertIdx++) {
-            VECTOR3* pVelocity_tmp = nullptr;
-            VECTOR3* vVelocity_tmp = nullptr;
-            double* ztop_tmp = nullptr;
+            int vertexOffset = localVertIdx * this->nVertLevels;
             this->computeTimeVaryingVar(localVertIdx,
                         this->cellVelocity[0], this->cellVertVelocity[0], this->cellZTop,
-                        pVelocity_tmp, vVelocity_tmp, ztop_tmp);
-            if (pVelocity_tmp == nullptr || vVelocity_tmp == nullptr || ztop_tmp == nullptr) {
-                std::cerr << "[MPASOReader::InitSolutions] Error: Time varying variables are null for local vertex index " << localVertIdx << std::endl;
-                std::exit(EXIT_FAILURE);
-            }
-            for (int vl = 0; vl < this->nVertLevels; vl++) {
-                vertexVelocity[ts][idx]     = pVelocity_tmp[vl];
-                vertexVertVelocity[ts][idx] = vVelocity_tmp[vl];
-                vertexZTop[gridBase + idx]           = ztop_tmp[vl];
-                idx++;
-            }
-            delete[] pVelocity_tmp;
-            delete[] vVelocity_tmp;
-            delete[] ztop_tmp;
+                        vertexVelocity[ts] + vertexOffset,
+                        vertexVertVelocity[ts] + vertexOffset,
+                        vertexZTop + gridBase + vertexOffset);
         }
         std::cout << "[MPASOReader::InitSolutions] Finished vertex conversion for timestep " << ts << "/" << N-1 << std::endl;
     }
@@ -683,24 +670,14 @@ void MPASOReader::UpdateSolutions(MPASOGrid* grid, Solution* &pSolution, Solutio
         this->readVertVelocityTop(read_start + cell_ts, 1);
 
         int ts_out = ts_out_start + cell_ts;
-        int idx = 0;
         size_t gridBase = static_cast<size_t>(ts_out) * nVertNodes;
         for (int localVertIdx = 0; localVertIdx < this->nLocalVertices; localVertIdx++) {
-            VECTOR3* pVelocity_tmp = nullptr;
-            VECTOR3* vVelocity_tmp = nullptr;
-            double* ztop_tmp = nullptr;
+            int vertexOffset = localVertIdx * this->nVertLevels;
             this->computeTimeVaryingVar(localVertIdx,
                         this->cellVelocity[0], this->cellVertVelocity[0], this->cellZTop,
-                        pVelocity_tmp, vVelocity_tmp, ztop_tmp);
-            for (int vl = 0; vl < this->nVertLevels; vl++) {
-                vertexVelocity[ts_out][idx]     = pVelocity_tmp[vl];
-                vertexVertVelocity[ts_out][idx] = vVelocity_tmp[vl];
-                vertexZTop[gridBase + idx]           = ztop_tmp[vl];
-                idx++;
-            }
-            delete[] pVelocity_tmp;
-            delete[] vVelocity_tmp;
-            delete[] ztop_tmp;
+                        vertexVelocity[ts_out] + vertexOffset,
+                        vertexVertVelocity[ts_out] + vertexOffset,
+                        vertexZTop + gridBase + vertexOffset);
         }
         std::cout << "[MPASOReader::UpdateSolutions] Finished vertex conversion for timestep " << read_start+cell_ts << "/" << read_start+n_read-1 << std::endl;
     }
@@ -1031,12 +1008,25 @@ void MPASOReader::readMaxLevelCell()
 
     // 1. Acquire varid for maxLevelCell
     int mlc_varid;
-    nc_inq_varid(ncid, mlc_str.c_str(), &mlc_varid);
+    if ((retval = nc_inq_varid(ncid, mlc_str.c_str(), &mlc_varid))) {
+        std::cerr << "[MPASOReader] nc_inq_varid maxLevelCell failed: "
+                  << nc_strerror(retval) << "\n";
+        std::exit(EXIT_FAILURE);
+    }
 
     int ndims, dimids[NC_MAX_DIMS];
-    nc_inq_var(ncid, mlc_varid, nullptr, nullptr, &ndims, dimids, nullptr);
+    if ((retval = nc_inq_var(ncid, mlc_varid, nullptr, nullptr,
+                             &ndims, dimids, nullptr))) {
+        std::cerr << "[MPASOReader] nc_inq_var maxLevelCell failed: "
+                  << nc_strerror(retval) << "\n";
+        std::exit(EXIT_FAILURE);
+    }
     size_t len_cells;
-    nc_inq_dimlen(ncid, dimids[0], &len_cells);
+    if ((retval = nc_inq_dimlen(ncid, dimids[0], &len_cells))) {
+        std::cerr << "[MPASOReader] nc_inq_dimlen maxLevelCell failed: "
+                  << nc_strerror(retval) << "\n";
+        std::exit(EXIT_FAILURE);
+    }
 
     assert(this->nTotalCells == static_cast<int>(len_cells));
 
@@ -1045,7 +1035,11 @@ void MPASOReader::readMaxLevelCell()
     this->maxLevelCell = new int[this->nTotalCells];
 
     // 3. Read data into the allocated array
-    nc_get_var_int(ncid, mlc_varid, this->maxLevelCell);
+    if ((retval = nc_get_var_int(ncid, mlc_varid, this->maxLevelCell))) {
+        std::cerr << "[MPASOReader] nc_get_var_int maxLevelCell failed: "
+                  << nc_strerror(retval) << "\n";
+        std::exit(EXIT_FAILURE);
+    }
 }
 
 void MPASOReader::readBottomDepth()
@@ -1227,6 +1221,9 @@ void MPASOReader::readCellVelocity(int startTimestep, int N)
 
     cellNodeNum = this->nTotalCells * this->nVertLevels;
 
+    if (this->requiredCellIndices.empty())
+        this->buildRequiredCellSet();
+
     // 5. free any previously loaded data and allocate N slots
     if (this->cellVelocity != nullptr) {
         for (int t = 0; t < this->nTimestepsInMem; ++t)
@@ -1249,26 +1246,42 @@ void MPASOReader::readCellVelocity(int startTimestep, int N)
     for (int t = 0; t < N; ++t) {
         start[0] = startTimestep + t;
 
+        auto copyCartesianComponent = [&](int dim) {
+            if (!this->requiredCellIndices.empty()) {
+                for (int gCellIdx : this->requiredCellIndices) {
+                    int offset = gCellIdx * this->nVertLevels;
+                    for (int j = 0; j < this->nVertLevels; j++) {
+                        double val = cellVel_tmp[offset+j];
+                        this->cellVelocity[t][offset+j][dim] =
+                            (val > 1.0e30 || val < -1.0e30) ? 0.0 : val;
+                    }
+                }
+            } else {
+                for (int i = 0; i < cellNodeNum; ++i) {
+                    double val = cellVel_tmp[i];
+                    this->cellVelocity[t][i][dim] =
+                        (val > 1.0e30 || val < -1.0e30) ? 0.0 : val;
+                }
+            }
+        };
+
         if ((retval = nc_get_vara_double(ncDataid, velX_id, start, count, cellVel_tmp))) {
             std::cerr << "nc_get_vara_double velocityX t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
             std::exit(EXIT_FAILURE);
         }
-        for (int i = 0; i < cellNodeNum; ++i)
-            this->cellVelocity[t][i][0] = (cellVel_tmp[i] > 1.0e30 || cellVel_tmp[i] < -1.0e30) ? 0.0 : cellVel_tmp[i];
+        copyCartesianComponent(0);
 
         if ((retval = nc_get_vara_double(ncDataid, velY_id, start, count, cellVel_tmp))) {
             std::cerr << "nc_get_vara_double velocityY t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
             std::exit(EXIT_FAILURE);
         }
-        for (int i = 0; i < cellNodeNum; ++i)
-            this->cellVelocity[t][i][1] = (cellVel_tmp[i] > 1.0e30 || cellVel_tmp[i] < -1.0e30) ? 0.0 : cellVel_tmp[i];
+        copyCartesianComponent(1);
 
         if ((retval = nc_get_vara_double(ncDataid, velZ_id, start, count, cellVel_tmp))) {
             std::cerr << "nc_get_vara_double velocityZ t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
             std::exit(EXIT_FAILURE);
         }
-        for (int i = 0; i < cellNodeNum; ++i)
-            this->cellVelocity[t][i][2] = (cellVel_tmp[i] > 1.0e30 || cellVel_tmp[i] < -1.0e30) ? 0.0 : cellVel_tmp[i];
+        copyCartesianComponent(2);
     }
 
     delete[] cellVel_tmp;
@@ -1550,6 +1563,10 @@ void MPASOReader::readVertVelocityTop(int startTimestep, int N)
         delete[] this->cellVertVelocity;
     }
     int totalBottomLevels = this->nVertLevelsP1 - 1;
+    assert(totalBottomLevels == this->nVertLevels);
+    if (this->requiredCellIndices.empty())
+        this->buildRequiredCellSet();
+
     this->cellVertVelocity  = new double*[N];
     this->nTimestepsInMem = N;
     for (int t = 0; t < N; ++t)
@@ -1570,13 +1587,21 @@ void MPASOReader::readVertVelocityTop(int startTimestep, int N)
                       << nc_strerror(retval) << "\n";
             std::exit(EXIT_FAILURE);
         }
-        for (int cellidx = 0; cellidx < this->nTotalCells; ++cellidx) {
-            size_t offset   = static_cast<size_t>(cellidx) * totalBottomLevels;
-            size_t offsetp1 = static_cast<size_t>(cellidx) * this->nVertLevelsP1;
+        auto copyVertVelocity = [&](int gCellIdx) {
+            size_t offset   = static_cast<size_t>(gCellIdx) * totalBottomLevels;
+            size_t offsetp1 = static_cast<size_t>(gCellIdx) * this->nVertLevelsP1;
             for (int v = 0; v < totalBottomLevels; ++v) {
                 double val = vertVelocity_tmp[offsetp1 + v];
                 this->cellVertVelocity[t][offset + v] = (val > 1.0e30 || val < -1.0e30) ? 0.0 : val;
             }
+        };
+
+        if (!this->requiredCellIndices.empty()) {
+            for (int gCellIdx : this->requiredCellIndices)
+                copyVertVelocity(gCellIdx);
+        } else {
+            for (int gCellIdx = 0; gCellIdx < this->nTotalCells; ++gCellIdx)
+                copyVertVelocity(gCellIdx);
         }
     }
 
@@ -1591,7 +1616,6 @@ void MPASOReader::readZTop(int timestep)
     int dimids[NC_MAX_VAR_DIMS];
     size_t dimlen0, dimlen1, dimlen2;
     size_t start[3], count[3];
-    double* zTop_tmp;
 
     assert(this->cfg.zTop);
 
@@ -1643,25 +1667,17 @@ void MPASOReader::readZTop(int timestep)
     start[1] = 0;                      count[1] = this->nTotalCells;
     start[2] = 0;                      count[2] = this->nVertLevels;
 
-    // 6. Allocate memory for temporary zTop storage
+    // 6. Read zTop directly into cellZTop
     size_t total = static_cast<size_t>(this->nTotalCells) * this->nVertLevels;
-    zTop_tmp = new double[total];
+    delete[] this->cellZTop;
+    this->cellZTop = new double[total];
     if ((retval = nc_get_vara_double(ncDataid, varid,
                                      start, count,
-                                     zTop_tmp))) {
+                                     this->cellZTop))) {
         std::cerr << "nc_get_vara_double zTop failed: "
                   << nc_strerror(retval) << "\n";
         std::exit(EXIT_FAILURE);
     }
-
-    // 7. Copy the data into cellZTop
-    delete[] this->cellZTop;
-    this->cellZTop = new double[total];
-    for (size_t i = 0; i < total; ++i) {
-        this->cellZTop[i] = zTop_tmp[i];
-    }
-
-    delete[] zTop_tmp;
 }
 
 void MPASOReader::readLayerThickness(int timestep)
@@ -1925,7 +1941,10 @@ void MPASOReader::computeCOVweights()
             double w2 = triangle_area_by_length(dist1, dist3, dist31);
             double w3 = triangle_area_by_length(dist1, dist2, dist12);
             double wsum = w1 + w2 + w3;
-            this->cov_weights[localVertIdx].Set(w1/wsum, w2/wsum, w3/wsum);
+            if (std::abs(wsum) <= 1.0e-30)
+                this->cov_weights[localVertIdx].Zero();
+            else
+                this->cov_weights[localVertIdx].Set(w1/wsum, w2/wsum, w3/wsum);
         }
     }
 }
@@ -2067,23 +2086,19 @@ void MPASOReader::computeCellVelocity(double* normalVelocity, VECTOR3*& cellVelo
 void MPASOReader::computeTimeVaryingVar(int localVertIdx,
                                         VECTOR3* cellVelocity, double* cellVertVelocity,
                                         double* cellZTop,
-                                        VECTOR3*& pVelocity_tmp, VECTOR3*& vVelocity_tmp,
-                                        double*& ztop_tmp)
+                                        VECTOR3* pVelocityOut, VECTOR3* vVelocityOut,
+                                        double* ztopOut)
 {
     assert(this->cov_weights != nullptr);
-    assert(pVelocity_tmp == nullptr);
-    assert(vVelocity_tmp == nullptr);
-    assert(ztop_tmp == nullptr);
-
-    pVelocity_tmp     = new VECTOR3[this->nVertLevels];
-    vVelocity_tmp     = new VECTOR3[this->nVertLevels];
-    ztop_tmp          = new double[this->nVertLevels];
+    assert(pVelocityOut != nullptr);
+    assert(vVelocityOut != nullptr);
+    assert(ztopOut != nullptr);
 
     if (this->cov_weights[localVertIdx].GetMax() == 0.0) {
         for (int vl = 0; vl < this->nVertLevels; vl++) {
-            pVelocity_tmp[vl].Zero();
-            vVelocity_tmp[vl].Zero();
-            ztop_tmp[vl]          = 0.0;
+            pVelocityOut[vl].Zero();
+            vVelocityOut[vl].Zero();
+            ztopOut[vl] = 0.0;
         }
     } else {
         int gVertIdx = this->localVert2GlobalVert[localVertIdx] - 1;
@@ -2096,16 +2111,16 @@ void MPASOReader::computeTimeVaryingVar(int localVertIdx,
         int c3offset = cellIndices[2] * this->nVertLevels;
         VECTOR3 w = this->cov_weights[localVertIdx];
         for (int vl = 0; vl < this->nVertLevels; vl++) {
-            vVelocity_tmp[vl].Zero();
+            vVelocityOut[vl].Zero();
             for (int dim = 0; dim < 3; dim++) {
-                pVelocity_tmp[vl][dim] = w[0]*cellVelocity[c1offset+vl][dim]
+                pVelocityOut[vl][dim] = w[0]*cellVelocity[c1offset+vl][dim]
                                        + w[1]*cellVelocity[c2offset+vl][dim]
                                        + w[2]*cellVelocity[c3offset+vl][dim];
             }
-            vVelocity_tmp[vl][0]   = w[0]*cellVertVelocity[c1offset+vl]
+            vVelocityOut[vl][0]   = w[0]*cellVertVelocity[c1offset+vl]
                                    + w[1]*cellVertVelocity[c2offset+vl]
                                    + w[2]*cellVertVelocity[c3offset+vl];
-            ztop_tmp[vl]           = w[0]*cellZTop[c1offset+vl]
+            ztopOut[vl]           = w[0]*cellZTop[c1offset+vl]
                                    + w[1]*cellZTop[c2offset+vl]
                                    + w[2]*cellZTop[c3offset+vl];
         }

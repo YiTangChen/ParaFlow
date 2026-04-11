@@ -12,6 +12,7 @@
 
 #include "Grid.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #pragma warning(disable : 4251 4100 4244 4101)
@@ -1181,9 +1182,12 @@ bool MPASOGrid::at_phys(VECTOR3& pos)
 int MPASOGrid::getCellVertices(int nodeId, CellTopoType cellType, vector<int>& vVertices)
 {
 	// nodeId is a local flat index (localCellIdx * nVertLevels + vLevel)
+	if (cellType != T5_CELL) return -1;
+	if (nodeId < 0 || this->nVertLevels <= 1) return -1;
 	int cellidx = nodeId / this->nVertLevels;
 	if (cellidx < 0 || cellidx >= this->nCells) return -1;
 	int vLevel = nodeId % this->nVertLevels;
+	if (vLevel < 0 || vLevel >= this->nVertLevels - 1) return -1;
 	int nVert = this->numVerticesOnCell[cellidx];
 	int offset = cellidx * this->nMaxEdges;
 
@@ -1205,9 +1209,11 @@ int MPASOGrid::getCellVertices(int nodeId, CellTopoType cellType, vector<int>& v
 int MPASOGrid::getCellVertices(int nodeId, CellTopoType cellType, int* vVertices)
 {
 	if (cellType != T5_CELL) return -1;
+	if (nodeId < 0 || this->nVertLevels <= 1) return -1;
 	int cellidx = nodeId / this->nVertLevels;
 	if (cellidx < 0 || cellidx >= this->nCells) return -1;
 	int vLevel = nodeId % this->nVertLevels;
+	if (vLevel < 0 || vLevel >= this->nVertLevels - 1) return -1;
 	int nVert = this->numVerticesOnCell[cellidx];
 	int offset = cellidx * this->nMaxEdges;
 	for(int i = 0; i < nVert; i++) {
@@ -1333,6 +1339,7 @@ int MPASOGrid::phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT)
 	int cellOffset = nearest_cellIdx * this->nVertLevels;
 
 	constexpr int MAX_VERT_LEVELS = 120;
+	assert(this->nVertLevels <= MAX_VERT_LEVELS);
 	double currztop[MAX_VERT_LEVELS];
 	double Aj[MAX_EDGES], Bk[MAX_EDGES];
 	for(int j = 0; j < curr_nVertices; j++)
@@ -1348,8 +1355,8 @@ int MPASOGrid::phys_to_cell(PointInfo& pInfo, double t, int* cachedLowT)
 		omegas[(k+1)%curr_nVertices] = w;
 		omega_sum += w;
 	}
-	if (omega_sum == 0.0)
-		omega_sum = 1e-6;
+	if (std::abs(omega_sum) <= 1.0e-30)
+		return -1;
 	for(int i = 0; i < curr_nVertices; i++)
 		omegas[i] = omegas[i] / omega_sum;
 
@@ -1490,6 +1497,7 @@ int MPASOGrid::phys_to_truelocalcell(PointInfo& pInfo, double t, int* cachedLowT
 	int cellOffset = nearest_cellIdx * this->nVertLevels;
 
 	constexpr int MAX_VERT_LEVELS = 120;
+	assert(this->nVertLevels <= MAX_VERT_LEVELS);
 	double currztop[MAX_VERT_LEVELS];
 	double Aj[MAX_EDGES], Bk[MAX_EDGES];
 	for(int j = 0; j < curr_nVertices; j++)
@@ -1505,8 +1513,8 @@ int MPASOGrid::phys_to_truelocalcell(PointInfo& pInfo, double t, int* cachedLowT
 		omegas[(k+1)%curr_nVertices] = w;
 		omega_sum += w;
 	}
-	if (omega_sum == 0.0)
-		omega_sum = 1e-6;
+	if (std::abs(omega_sum) <= 1.0e-30)
+		return -1;
 	for(int i = 0; i < curr_nVertices; i++)
 		omegas[i] = omegas[i] / omega_sum;
 
