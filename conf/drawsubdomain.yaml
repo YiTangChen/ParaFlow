@@ -20,9 +20,9 @@ velocity:
     Y: null
     Z: null
   spherical:    # zonal & meridional
-    zonal: timeDaily_avg_transportVelocityZonal
-    meridional: timeDaily_avg_transportVelocityMeridional
-  normal: null   # normal
+    zonal: null
+    meridional: null
+  normal: timeDaily_avg_normalVelocity   # normal
 zTop: null
 layerThickness: timeDaily_avg_layerThickness
 vertVelocityTop: timeDaily_avg_vertVelocityTop
