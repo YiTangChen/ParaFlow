@@ -23,14 +23,7 @@ MPASOReader::MPASOReader(const char* infile, int inAreaId, int inNTotalCells, in
     this->areaIndices = inAreaIndices;
     this->cfg = incfg;
     this->dataFiles = incfg.dataFiles;
-    this->nTimestepsTotal = queryTimeDimFromNcid(this->ncDataid);
-    for (int i = 1; i < (int)this->dataFiles.size(); i++) {
-        int tmpid;
-        if (nc_open(this->dataFiles[i].c_str(), NC_NOWRITE, &tmpid) == NC_NOERR) {
-            this->nTimestepsTotal += queryTimeDimFromNcid(tmpid);
-            nc_close(tmpid);
-        }
-    }
+    this->buildTimeIndex();
 }
 
 MPASOReader::MPASOReader(const char* meshfile, const char* datafile, int inAreaId, int inNTotalCells, int* inAreaIndices, TimeVaryingDataConfig &incfg)
@@ -51,14 +44,7 @@ MPASOReader::MPASOReader(const char* meshfile, const char* datafile, int inAreaI
     this->areaIndices = inAreaIndices;
     this->cfg = incfg;
     this->dataFiles = incfg.dataFiles;
-    this->nTimestepsTotal = queryTimeDimFromNcid(this->ncDataid);
-    for (int i = 1; i < (int)this->dataFiles.size(); i++) {
-        int tmpid;
-        if (nc_open(this->dataFiles[i].c_str(), NC_NOWRITE, &tmpid) == NC_NOERR) {
-            this->nTimestepsTotal += queryTimeDimFromNcid(tmpid);
-            nc_close(tmpid);
-        }
-    }
+    this->buildTimeIndex();
 }
 
 MPASOReader::~MPASOReader()
@@ -138,6 +124,11 @@ void MPASOReader::Reset()
     this->timestepOffset   = 0;
     this->cellZTop = nullptr;
     this->requiredCellIndices.clear();
+    this->m_fileTimestamps.clear();
+    this->m_timestepFileIdx.clear();
+    this->m_timestepLocalIdx.clear();
+    this->m_fileTimestepBase.clear();
+    this->m_fileTimestepCount.clear();
     this->currentFileIdx          = 0;
     this->nTimestepsTotal         = 0;
     this->currentFileTimestepBase = 0;
@@ -165,21 +156,143 @@ int MPASOReader::queryTimeDimFromNcid(int ncid)
     return static_cast<int>(len);
 }
 
-void MPASOReader::switchToNextDataFile()
+void MPASOReader::buildTimeIndex()
 {
-    this->currentFileTimestepBase += this->nTimestepsInFile;
+    this->m_timestepFileIdx.clear();
+    this->m_timestepLocalIdx.clear();
+    this->m_fileTimestepBase.clear();
+    this->m_fileTimestepCount.clear();
+
+    int nFiles = this->dataFiles.empty() ? 1 : static_cast<int>(this->dataFiles.size());
+    this->m_fileTimestepBase.assign(nFiles, -1);
+    this->m_fileTimestepCount.assign(nFiles, 0);
+
+    int total = 0;
+    for (int fileIdx = 0; fileIdx < nFiles; ++fileIdx) {
+        int count = 0;
+        if (fileIdx == this->currentFileIdx) {
+            count = queryTimeDimFromNcid(this->ncDataid);
+        } else if (!this->dataFiles.empty()) {
+            int tmpid;
+            if (nc_open(this->dataFiles[fileIdx].c_str(), NC_NOWRITE, &tmpid) == NC_NOERR) {
+                count = queryTimeDimFromNcid(tmpid);
+                nc_close(tmpid);
+            } else {
+                std::cerr << "[MPASOReader::buildTimeIndex] Skipping unreadable file "
+                          << fileIdx << " (" << this->dataFiles[fileIdx] << ").\n";
+            }
+        }
+
+        this->m_fileTimestepBase[fileIdx] = total;
+        this->m_fileTimestepCount[fileIdx] = count;
+        for (int localTimestep = 0; localTimestep < count; ++localTimestep) {
+            this->m_timestepFileIdx.push_back(fileIdx);
+            this->m_timestepLocalIdx.push_back(localTimestep);
+        }
+        total += count;
+    }
+
+    this->nTimestepsTotal = total;
+    if (this->currentFileIdx >= 0 && this->currentFileIdx < nFiles) {
+        this->currentFileTimestepBase = this->m_fileTimestepBase[this->currentFileIdx];
+        this->nTimestepsInFile = this->m_fileTimestepCount[this->currentFileIdx];
+    }
+}
+
+void MPASOReader::ensureDataFileOpen(int fileIdx)
+{
+    if (fileIdx == this->currentFileIdx)
+        return;
+
+    if (this->dataFiles.empty()) {
+        if (fileIdx == 0)
+            return;
+        throw std::runtime_error("MPASOReader: requested a non-existent data file");
+    }
+    if (fileIdx < 0 || fileIdx >= static_cast<int>(this->dataFiles.size()))
+        throw std::runtime_error("MPASOReader: data file index out of range");
+
     nc_close(this->ncDataid);
-    this->currentFileIdx++;
-    const char* nextFile = this->dataFiles[this->currentFileIdx].c_str();
+    const char* nextFile = this->dataFiles[fileIdx].c_str();
     if ((this->retval = nc_open(nextFile, NC_NOWRITE, &this->ncDataid))) {
         fprintf(stderr, "Error: Cannot open %s (%s)\n", nextFile, nc_strerror(this->retval));
-        throw std::runtime_error("MPASOReader: failed to open next NetCDF file");
+        throw std::runtime_error("MPASOReader: failed to open NetCDF file");
     }
-    this->nTimestepsInFile = queryTimeDimFromNcid(this->ncDataid);
-    this->timestepOffset   = 0;
-    this->nTimestepsInMem  = 0;
-    std::cerr << "[MPASOReader] Switched to file " << this->currentFileIdx
-              << " (" << nextFile << "), nTimestepsInFile=" << this->nTimestepsInFile << "\n";
+
+    this->currentFileIdx = fileIdx;
+    if (fileIdx >= static_cast<int>(this->m_fileTimestepCount.size()))
+        this->buildTimeIndex();
+    this->nTimestepsInFile = this->m_fileTimestepCount[fileIdx];
+    this->currentFileTimestepBase = this->m_fileTimestepBase[fileIdx];
+    this->timestepOffset = 0;
+    this->nTimestepsInMem = 0;
+}
+
+void MPASOReader::setGlobalTimestepOffset(int globalOffset)
+{
+    if (this->m_timestepFileIdx.empty())
+        this->buildTimeIndex();
+
+    if (globalOffset <= 0) {
+        int fileIdx = this->m_timestepFileIdx.empty() ? 0 : this->m_timestepFileIdx.front();
+        this->ensureDataFileOpen(fileIdx);
+        this->timestepOffset = 0;
+        return;
+    }
+
+    if (globalOffset >= this->nTimestepsTotal) {
+        if (!this->m_timestepFileIdx.empty()) {
+            int lastGlobal = this->nTimestepsTotal - 1;
+            int fileIdx = this->m_timestepFileIdx[lastGlobal];
+            this->ensureDataFileOpen(fileIdx);
+            this->timestepOffset = this->m_timestepLocalIdx[lastGlobal] + 1;
+        }
+        return;
+    }
+
+    int fileIdx = this->m_timestepFileIdx[globalOffset];
+    this->ensureDataFileOpen(fileIdx);
+    this->timestepOffset = this->m_timestepLocalIdx[globalOffset];
+}
+
+void MPASOReader::loadGlobalTimestepIntoSlot(int globalTimestep, int outputSlot,
+                                             int nVertNodes,
+                                             VECTOR3** vertexVelocity,
+                                             VECTOR3** vertexVertVelocity,
+                                             double* vertexZTop)
+{
+    if (this->m_timestepFileIdx.empty())
+        this->buildTimeIndex();
+    assert(globalTimestep >= 0 && globalTimestep < this->nTimestepsTotal);
+
+    int fileIdx = this->m_timestepFileIdx[globalTimestep];
+    int localTimestep = this->m_timestepLocalIdx[globalTimestep];
+    this->ensureDataFileOpen(fileIdx);
+
+    if (cfg.zTop)
+        this->readZTop(localTimestep);
+    else
+        this->readLayerThickness(localTimestep);
+
+    if (cfg.velocity.cartesian.X)
+        this->readCellVelocity(localTimestep, 1);
+    else if (cfg.velocity.spherical.zonal)
+        this->readZonMeridVelocity(localTimestep, 1);
+    else if (cfg.velocity.normal)
+        this->readNormalVelocity(localTimestep, 1);
+    else
+        std::cerr << "[MPASOReader] Error: cfg.velocity is not properly set." << std::endl;
+    this->readVertVelocityTop(localTimestep, 1);
+
+    size_t gridBase = static_cast<size_t>(outputSlot) * nVertNodes;
+    for (int localVertIdx = 0; localVertIdx < this->nLocalVertices; localVertIdx++) {
+        int vertexOffset = localVertIdx * this->nVertLevels;
+        this->computeTimeVaryingVar(localVertIdx,
+                    this->cellVelocity[0], this->cellVertVelocity[0], this->cellZTop,
+                    vertexVelocity[outputSlot] + vertexOffset,
+                    vertexVertVelocity[outputSlot] + vertexOffset,
+                    vertexZTop + gridBase + vertexOffset);
+    }
 }
 
 void MPASOReader::appendTimestampsFromNcid(int ncid, double& t0, bool isFirst)
@@ -481,16 +594,20 @@ MPASOGrid* MPASOReader::CreateMPASOGrid()
 void MPASOReader::InitSolutions(MPASOGrid* grid, Solution* &pSolution, Solution* &vSolution)
 {
     std::cout << "[MPASOReader::InitSolutions] Initializing solutions..." << std::endl;
-    if (this->nTimestepsInFile <= 0)
-        this->nTimestepsInFile = queryTimeDimFromNcid(this->ncDataid);
+    if (this->m_timestepFileIdx.empty())
+        this->buildTimeIndex();
+    this->readAllTimestamps();
     assert(this->nVertLevels > 0);
+    assert(this->nTimestepsTotal > 0);
     grid->setNVertLevels(this->nVertLevels);
 
     int N = (cfg.isTimeVarying && cfg.isTimeVarying.value() && cfg.loadNTimeSteps)
                 ? cfg.loadNTimeSteps.value() : 1;
-    N = std::min(N, this->nTimestepsInFile);  // clamp to available timesteps in file
+    N = std::min(N, this->nTimestepsTotal);
     grid->setNTimestepsLoaded(N);
-    std::cout << "[MPASOReader::InitSolutions] Loading 0 - " << N - 1 << " of " << this->nTimestepsInFile << " timestep(s)." << std::endl;
+    std::cout << "[MPASOReader::InitSolutions] Loading global timestep 0 - "
+              << N - 1 << " of " << this->nTimestepsTotal
+              << " timestep(s)." << std::endl;
 
     this->buildRequiredCellSet();
     this->computeCOVweights();
@@ -508,31 +625,12 @@ void MPASOReader::InitSolutions(MPASOGrid* grid, Solution* &pSolution, Solution*
 
     // Stream: read one timestep at a time, convert immediately, then free cell-space data
     for (int ts = 0; ts < N; ts++) {
-        if (cfg.zTop)
-            this->readZTop(ts);
-        else
-            this->readLayerThickness(ts);
-
-        if (cfg.velocity.cartesian.X)
-            this->readCellVelocity(ts, 1);
-        else if (cfg.velocity.spherical.zonal)
-            this->readZonMeridVelocity(ts, 1);
-        else if (cfg.velocity.normal)
-            this->readNormalVelocity(ts, 1);
-        else
-            std::cerr << "[MPASOReader::InitSolutions] Error: cfg.velocity is not properly set." << std::endl;
-        this->readVertVelocityTop(ts, 1);
-
-        size_t gridBase = static_cast<size_t>(ts) * nVertNodes;
-        for (int localVertIdx = 0; localVertIdx < this->nLocalVertices; localVertIdx++) {
-            int vertexOffset = localVertIdx * this->nVertLevels;
-            this->computeTimeVaryingVar(localVertIdx,
-                        this->cellVelocity[0], this->cellVertVelocity[0], this->cellZTop,
-                        vertexVelocity[ts] + vertexOffset,
-                        vertexVertVelocity[ts] + vertexOffset,
-                        vertexZTop + gridBase + vertexOffset);
-        }
-        std::cout << "[MPASOReader::InitSolutions] Finished vertex conversion for timestep " << ts << "/" << N-1 << std::endl;
+        this->loadGlobalTimestepIntoSlot(ts, ts, nVertNodes,
+                                         vertexVelocity,
+                                         vertexVertVelocity,
+                                         vertexZTop);
+        std::cout << "[MPASOReader::InitSolutions] Finished vertex conversion for global timestep "
+                  << "(0, " << ts << ", " << N - 1 << ")" << std::endl;
     }
 
     // Clean up cell-space data (last timestep's allocation from the streaming loop)
@@ -546,8 +644,7 @@ void MPASOReader::InitSolutions(MPASOGrid* grid, Solution* &pSolution, Solution*
     delete[] this->cellZTop;
     this->cellZTop = nullptr;
 
-    // Read real timestamps and slice [0, N-1]
-    this->readAllTimestamps();
+    // Slice real timestamps for [0, N-1].
     std::vector<double> windowTs;
     if (!m_fileTimestamps.empty() && N <= (int)m_fileTimestamps.size()) {
         windowTs.assign(m_fileTimestamps.begin(), m_fileTimestamps.begin() + N);
@@ -583,55 +680,44 @@ void MPASOReader::InitSolutions(MPASOGrid* grid, Solution* &pSolution, Solution*
     delete[] vertexVelocity;
     delete[] vertexVertVelocity;
     delete[] vertexZTop;
-    this->timestepOffset += N;
+    this->setGlobalTimestepOffset(N);
 }
 
 void MPASOReader::UpdateSolutions(MPASOGrid* grid, Solution* &pSolution, Solution* &vSolution)
 {
-    int N = this->nTimestepsInMem > 0 ? this->nTimestepsInMem
-          : ((cfg.isTimeVarying && cfg.isTimeVarying.value() && cfg.loadNTimeSteps)
-                ? cfg.loadNTimeSteps.value() : 1);
+    if (this->m_timestepFileIdx.empty())
+        this->buildTimeIndex();
 
-    // Check if the current file is exhausted and we need to switch to the next one
-    bool fileSwitched = false;
-    if (this->timestepOffset >= this->nTimestepsInFile) {
-        if (this->currentFileIdx + 1 >= (int)this->dataFiles.size()) {
-            std::cerr << "[MPASOReader::UpdateSolutions] No more files to load.\n";
-            return;
-        }
-        this->switchToNextDataFile();
-        fileSwitched = true;
+    int N = (cfg.isTimeVarying && cfg.isTimeVarying.value() && cfg.loadNTimeSteps)
+                ? cfg.loadNTimeSteps.value() : 1;
+    int nextGlobal = this->getTimestepOffset();
+    if (nextGlobal >= this->nTimestepsTotal) {
+        std::cerr << "[MPASOReader::UpdateSolutions] No more timesteps to load.\n";
+        return;
     }
 
-    // Overlap by 1 within the same file; when file just switched the boundary
-    // timestep is already in memory (last ts of previous file), so start at 0.
-    int start = (!fileSwitched && N > 1) ? this->timestepOffset - 1 : this->timestepOffset;
-    N = std::min(N, this->nTimestepsInFile - start);
+    int globalStart = (nextGlobal > 0 && N > 1) ? nextGlobal - 1 : nextGlobal;
+    N = std::min(N, this->nTimestepsTotal - globalStart);
     if (N <= 0) {
         std::cerr << "[MPASOReader::UpdateSolutions] No more timesteps to load.\n";
         return;
     }
 
     int nVertNodes = this->nLocalVertices * this->nVertLevels;
+    bool hasBoundary = (globalStart < nextGlobal && pSolution && vSolution);
 
     // Copy boundary timestep (start == old window's last ts) from old solutions to avoid
     // recomputing the vertex-space conversion for data we already have.
     VECTOR3* boundary_p = nullptr;
     VECTOR3* boundary_v = nullptr;
     int old_last = -1;
-    if (N > 1 && pSolution && vSolution) {
+    if (hasBoundary) {
         old_last = pSolution->GetNTimeSteps() - 1;
         boundary_p = new VECTOR3[nVertNodes];
         boundary_v = new VECTOR3[nVertNodes];
         std::memcpy(boundary_p, pSolution->GetTimestepData(old_last), nVertNodes * sizeof(VECTOR3));
         std::memcpy(boundary_v, vSolution->GetTimestepData(old_last), nVertNodes * sizeof(VECTOR3));
     }
-
-    // Read only the N-1 new timesteps (skip the boundary one already copied above).
-    // For file switch: boundary is from old file, new file starts at position 0.
-    // For normal: boundary is at position (start = timestepOffset-1), new reads from timestepOffset.
-    int read_start = fileSwitched ? 0 : (N > 1 ? start + 1 : start);
-    int n_read     = (N > 1) ? N - 1 : N;
 
     VECTOR3** vertexVelocity     = new VECTOR3*[N];
     VECTOR3** vertexVertVelocity = new VECTOR3*[N];
@@ -642,51 +728,30 @@ void MPASOReader::UpdateSolutions(MPASOGrid* grid, Solution* &pSolution, Solutio
     double* vertexZTop           = new double[static_cast<size_t>(N) * nVertNodes];
 
     // Slot 0: copy boundary from old solution (no recomputation)
-    if (N > 1 && boundary_p) {
+    if (hasBoundary && boundary_p) {
         std::memcpy(vertexVelocity[0],     boundary_p, nVertNodes * sizeof(VECTOR3));
         std::memcpy(vertexVertVelocity[0], boundary_v, nVertNodes * sizeof(VECTOR3));
         std::memcpy(vertexZTop, grid->getZTopTimestep(old_last), nVertNodes * sizeof(double));
         delete[] boundary_p; boundary_p = nullptr;
         delete[] boundary_v; boundary_v = nullptr;
-        std::cerr << "[MPASOReader::UpdateSolutions] Copied boundary timestep from previous window for timestep " << start << "." << std::endl;
+        std::cerr << "[MPASOReader::UpdateSolutions] Copied boundary timestep from previous window for global timestep "
+                  << globalStart << "." << std::endl;
     }
 
-    // Slots 1..N-1 (or 0..0 when N==1): stream one timestep at a time, convert immediately
-    int ts_out_start = (N > 1) ? 1 : 0;
-    for (int cell_ts = 0; cell_ts < n_read; cell_ts++) {
-        if (cfg.zTop)
-            this->readZTop(read_start + cell_ts);
-        else
-            this->readLayerThickness(read_start + cell_ts);
-
-        if (cfg.velocity.cartesian.X)
-            this->readCellVelocity(read_start + cell_ts, 1);
-        else if (cfg.velocity.spherical.zonal)
-            this->readZonMeridVelocity(read_start + cell_ts, 1);
-        else if (cfg.velocity.normal)
-            this->readNormalVelocity(read_start + cell_ts, 1);
-        else
-            std::cerr << "[MPASOReader::UpdateSolutions] Error: cfg.velocity is not properly set." << std::endl;
-        this->readVertVelocityTop(read_start + cell_ts, 1);
-
-        int ts_out = ts_out_start + cell_ts;
-        size_t gridBase = static_cast<size_t>(ts_out) * nVertNodes;
-        for (int localVertIdx = 0; localVertIdx < this->nLocalVertices; localVertIdx++) {
-            int vertexOffset = localVertIdx * this->nVertLevels;
-            this->computeTimeVaryingVar(localVertIdx,
-                        this->cellVelocity[0], this->cellVertVelocity[0], this->cellZTop,
-                        vertexVelocity[ts_out] + vertexOffset,
-                        vertexVertVelocity[ts_out] + vertexOffset,
-                        vertexZTop + gridBase + vertexOffset);
-        }
-        std::cout << "[MPASOReader::UpdateSolutions] Finished vertex conversion for timestep " << read_start+cell_ts << "/" << read_start+n_read-1 << std::endl;
+    // Fill the remaining slots by global timestep; this can span any number of files.
+    int ts_out_start = hasBoundary ? 1 : 0;
+    for (int ts_out = ts_out_start; ts_out < N; ++ts_out) {
+        int globalTimestep = globalStart + ts_out;
+        this->loadGlobalTimestepIntoSlot(globalTimestep, ts_out, nVertNodes,
+                                         vertexVelocity,
+                                         vertexVertVelocity,
+                                         vertexZTop);
+        std::cout << "[MPASOReader::UpdateSolutions] Finished vertex conversion for global timestep "
+                  << "(" << globalStart << ", " << globalTimestep << ", "
+                  << globalStart + N - 1 << ")" << std::endl;
     }
 
     // Slice timestamps using global index.
-    // For file switch: boundary ts is last ts of old file = currentFileTimestepBase - 1.
-    // For normal: window starts at currentFileTimestepBase + start.
-    int globalStart = fileSwitched ? (this->currentFileTimestepBase - 1)
-                                   : (this->currentFileTimestepBase + start);
     std::vector<double> windowTs;
     if (!m_fileTimestamps.empty() && globalStart >= 0 && globalStart + N <= (int)m_fileTimestamps.size()) {
         windowTs.assign(m_fileTimestamps.begin() + globalStart,
@@ -737,7 +802,7 @@ void MPASOReader::UpdateSolutions(MPASOGrid* grid, Solution* &pSolution, Solutio
     delete[] vertexVertVelocity;
     delete[] vertexZTop;
 
-    this->timestepOffset += (N > 1) ? N - 1 : 1;
+    this->setGlobalTimestepOffset(globalStart + N);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1806,23 +1871,39 @@ void MPASOReader::readAllTimestamps()
     }
     if (!m_fileTimestamps.empty())
         return;  // already read
+    if (this->m_timestepFileIdx.empty())
+        this->buildTimeIndex();
 
-    // File 0 (already open): sets t0 from first timestep
     double t0 = 0.0;
     m_fileTimestamps.clear();
-    this->appendTimestampsFromNcid(ncDataid, t0, true);
+    m_fileTimestamps.reserve(this->nTimestepsTotal);
 
-    // Remaining files: open temporarily, append using same t0
-    for (int i = 1; i < (int)this->dataFiles.size(); i++) {
-        int tmpid;
-        if (nc_open(this->dataFiles[i].c_str(), NC_NOWRITE, &tmpid) == NC_NOERR) {
-            this->appendTimestampsFromNcid(tmpid, t0, false);
-            nc_close(tmpid);
+    int nFiles = this->dataFiles.empty() ? 1 : static_cast<int>(this->dataFiles.size());
+    for (int fileIdx = 0; fileIdx < nFiles; fileIdx++) {
+        if (fileIdx < static_cast<int>(this->m_fileTimestepCount.size()) &&
+            this->m_fileTimestepCount[fileIdx] <= 0)
+            continue;
+
+        if (fileIdx == this->currentFileIdx) {
+            this->appendTimestampsFromNcid(this->ncDataid, t0, m_fileTimestamps.empty());
+        } else if (!this->dataFiles.empty()) {
+            int tmpid;
+            if (nc_open(this->dataFiles[fileIdx].c_str(), NC_NOWRITE, &tmpid) == NC_NOERR) {
+                this->appendTimestampsFromNcid(tmpid, t0, m_fileTimestamps.empty());
+                nc_close(tmpid);
+            }
         }
     }
 
+    if (!m_fileTimestamps.empty() && (int)m_fileTimestamps.size() != this->nTimestepsTotal) {
+        std::cerr << "[MPASOReader::readAllTimestamps] Warning: read "
+                  << m_fileTimestamps.size() << " timestamp(s), expected "
+                  << this->nTimestepsTotal << ". Falling back to index time for incomplete windows.\n";
+        m_fileTimestamps.clear();
+    }
+
     std::cout << "[MPASOReader::readAllTimestamps] Read " << m_fileTimestamps.size()
-              << " timestamps across " << std::max(1, (int)this->dataFiles.size()) << " file(s)."
+              << " timestamps across " << nFiles << " file(s)."
               << " t[0]=0.0, t[last]=" << (m_fileTimestamps.empty() ? 0.0 : m_fileTimestamps.back()) << " s\n";
 }
 

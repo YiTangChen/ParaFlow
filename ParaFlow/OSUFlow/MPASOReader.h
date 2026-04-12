@@ -104,6 +104,10 @@ private:
     double* cellZTop;
     TimeVaryingDataConfig cfg;
     std::vector<double> m_fileTimestamps;  // real timestamps (seconds) across all files
+    std::vector<int> m_timestepFileIdx;     // global timestep -> dataFiles index
+    std::vector<int> m_timestepLocalIdx;    // global timestep -> timestep within that file
+    std::vector<int> m_fileTimestepBase;    // dataFiles index -> first global timestep
+    std::vector<int> m_fileTimestepCount;   // dataFiles index -> number of timesteps
 
     // Multi-file support
     std::vector<std::string> dataFiles;       // ordered list of all data files
@@ -153,7 +157,14 @@ public:
 
 private:
     static int queryTimeDimFromNcid(int ncid);   // read "Time" dimension from an open NetCDF id
-    void switchToNextDataFile();                 // close current file, open dataFiles[++currentFileIdx]
+    void buildTimeIndex();                       // build global timestep -> (file, local timestep)
+    void ensureDataFileOpen(int fileIdx);        // switch ncDataid to dataFiles[fileIdx] if needed
+    void setGlobalTimestepOffset(int globalOffset);
+    void loadGlobalTimestepIntoSlot(int globalTimestep, int outputSlot,
+                                    int nVertNodes,
+                                    VECTOR3** vertexVelocity,
+                                    VECTOR3** vertexVertVelocity,
+                                    double* vertexZTop);
     void appendTimestampsFromNcid(int ncid, double& t0, bool isFirst);  // parse xtime into m_fileTimestamps
     void buildRequiredCellSet();
     void computeCOVweights();
