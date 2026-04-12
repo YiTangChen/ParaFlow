@@ -1,0 +1,28 @@
+enable_timing: false
+
+maxsteps: 1
+nproc: 256
+nblocks: 256
+latResolution: 1200
+lonResolution: 2400
+meshfile_src: /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/ocean.EC30to60E2r2.210210.nc
+datafile_src: /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-01-01.nc
+graph_partition_indices: lowres_20y.info.part.256
+isBinarySeed: true
+seedFile: reg_seeds.bin
+
+# time-varying variables
+isTimeVarying: false
+velocity:
+  cartesian:     # XYZ
+    X: null
+    Y: null
+    Z: null
+  spherical:    # zonal & meridional
+    zonal: null
+    meridional: null
+  normal: timeMonthly_avg_normalVelocity   # normal
+zTop: null
+layerThickness: timeMonthly_avg_layerThickness
+vertVelocityTop: timeMonthly_avg_vertVelocityTop
+xtime: xtime_startMonthly

@@ -18,4 +18,4 @@ export OMP_PLACES=threads
 export OMP_PROC_BIND=spread
 
 #run the application: 
-time srun -n 256 -c 16 --cpu_bind=cores  ./DrawSubdomain conf/drawsubdomain.yaml
+time srun -n 256 -c 16 --cpu_bind=cores  ./DrawSubdomain conf/nersc_lowres_drawsubdomain.yaml

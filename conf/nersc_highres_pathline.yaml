@@ -1,0 +1,65 @@
+enable_timing: true
+outputDir: pathlines
+
+maxsteps: 4000000
+record_interval: 60
+dt: 30.0
+nproc: 256
+nblocks: 256
+meshfile_src: /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.rst.0015-01-01_00000.nc
+datafile_src: [/pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-01-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-02-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-03-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-04-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-05-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-06-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-07-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-08-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-09-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-10-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-11-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-12-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-01-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-02-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-03-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-04-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-05-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-06-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-07-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-08-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-09-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-10-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-11-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0016-12-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-01-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-02-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-03-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-04-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-05-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-06-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-07-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-08-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-09-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-10-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-11-01.nc,
+                /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-12-01.nc]
+graph_partition_indices: highres_6y.info.part.256
+isBinarySeed: true
+seedFile: seeds/random_seeds.bin
+
+# time-varying variables
+isTimeVarying: true
+loadNTimeSteps: 16
+velocity:
+  cartesian:     # XYZ
+    X: null
+    Y: null
+    Z: null
+  spherical:    # zonal & meridional
+    zonal: null
+    meridional: null
+  normal: timeMonthly_avg_normalVelocity   # normal
+zTop: null
+layerThickness: timeMonthly_avg_layerThickness
+vertVelocityTop: timeMonthly_avg_vertVelocityTop
+xtime: xtime_startMonthly

@@ -42,7 +42,9 @@ Thumbs.db
 *.pdf
 *.log
 *.csv
-/nc2graph.info.part.*
+
+# Graph partition files
+*.info.part.*
 
 # Generated helper files from vendored dependencies
 /ParaFlow/yaml-cpp/yaml-cpp-config.cmake

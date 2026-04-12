@@ -18,4 +18,4 @@ export OMP_PLACES=threads
 export OMP_PROC_BIND=spread
 
 #run the application: 
-time srun -n 256 -c 16 --cpu_bind=cores  ./ParaFlow_pathline conf/ParaFlow_pathline.yaml
+time srun -n 256 -c 16 --cpu_bind=cores  ./ParaFlow_pathline conf/nersc_lowres_pathline.yaml
