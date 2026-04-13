@@ -112,11 +112,11 @@ def main():
     ax.imshow(display, cmap='Blues', origin='lower', vmin=0, vmax=1,
               extent=[-180, 180, -90, 90], aspect='auto')
 
-    # Color each segment by depth using 'hot' (dark red → orange → yellow → white)
+    # Color each segment by depth using reversed 'hot' (white/yellow -> orange -> dark red)
     # which contrasts clearly against the light blue background
     lw    = 0.5
     alpha = 0.8
-    depth_cmap = matplotlib.colormaps['hot']
+    depth_cmap = matplotlib.colormaps['hot_r']
 
     # Global depth range for a consistent colormap across all traces
     all_depths = [p[2] for t in traces for p in t['pts']]
