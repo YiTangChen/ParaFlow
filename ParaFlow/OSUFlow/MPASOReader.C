@@ -2,6 +2,26 @@
 #include <cmath>
 #include <cstring>
 
+// Chunked I/O helper: pick how many cells (or edges) to read per nc_get_vara_double
+// call so that the transient tmp buffer never exceeds TARGET_CHUNK_BYTES (1 GB).
+// Default target is 1/16 of the full dimension, clamped by the byte cap.
+static int pickRowChunkSize(int nRowsTotal, int nLevels)
+{
+    constexpr size_t TARGET_CHUNK_BYTES = 1024ull * 1024ull * 1024ull;  // 1 GB
+    if (nRowsTotal <= 0 || nLevels <= 0) return nRowsTotal;
+
+    int chunkSize = std::max(1, nRowsTotal / 16);
+    size_t bytes = static_cast<size_t>(chunkSize) * static_cast<size_t>(nLevels) * sizeof(double);
+    if (bytes > TARGET_CHUNK_BYTES) {
+        size_t maxRows = TARGET_CHUNK_BYTES / (static_cast<size_t>(nLevels) * sizeof(double));
+        if (maxRows < 1) maxRows = 1;
+        chunkSize = static_cast<int>(maxRows);
+    }
+    if (chunkSize < 1) chunkSize = 1;
+    if (chunkSize > nRowsTotal) chunkSize = nRowsTotal;
+    return chunkSize;
+}
+
 MPASOReader::MPASOReader(const char* infile)
 {
     if ((retval = nc_open(infile, NC_NOWRITE, &ncDataid))) {
@@ -83,6 +103,11 @@ MPASOReader::~MPASOReader()
         delete[] this->cellVertVelocity;
     }
     delete[] this->cellZTop;
+    delete[] this->globalCell2RequiredCell;
+    delete[] this->cellsOnLocalVertex;
+    delete[] this->requiredCellCoord;
+    delete[] this->maxLevelRequiredCell;
+    delete[] this->bottomDepthRequiredCell;
 }
 
 void MPASOReader::Reset()
@@ -123,6 +148,12 @@ void MPASOReader::Reset()
     this->nTimestepsInMem  = 0;
     this->timestepOffset   = 0;
     this->cellZTop = nullptr;
+    this->nRequiredCells = 0;
+    this->globalCell2RequiredCell  = nullptr;
+    this->cellsOnLocalVertex       = nullptr;
+    this->requiredCellCoord        = nullptr;
+    this->maxLevelRequiredCell     = nullptr;
+    this->bottomDepthRequiredCell  = nullptr;
     this->requiredCellIndices.clear();
     this->m_fileTimestamps.clear();
     this->m_timestepFileIdx.clear();
@@ -588,6 +619,37 @@ MPASOGrid* MPASOReader::CreateMPASOGrid()
     }
     grid->setMaxLevelCell(localMaxLevelCell);
     delete[] localMaxLevelCell;
+
+    // Build compact cell-space structures that hot-path code (streaming reads,
+    // computeCOVweights, computeTimeVaryingVar) will use instead of global arrays.
+    this->buildRequiredCellSet();
+    this->buildCompactCellStructures();
+
+    // Precompute COV weights now while vertexCoord is still alive, so that
+    // InitSolutions/UpdateSolutions never have to touch global mesh arrays.
+    this->computeCOVweights();
+
+    // If using normal velocity, eagerly compute edge normals so we can free
+    // cellCoord / vertexCoord / verticesOnEdge. (numVerticesOnCell / edgesOnCell /
+    // edgeNormal must stay alive for per-timestep computeCellVelocity.)
+    bool usingNormalVelocity = static_cast<bool>(this->cfg.velocity.normal);
+    if (usingNormalVelocity)
+        this->computeEdgeNormalDirection();
+
+    // Free global mesh arrays that the hot path no longer needs.
+    delete[] this->maxLevelCell;            this->maxLevelCell            = nullptr;
+    delete[] this->bottomDepth;             this->bottomDepth             = nullptr;
+    delete[] this->cellsOnVertex;           this->cellsOnVertex           = nullptr;
+    delete[] this->globalCell2RequiredCell; this->globalCell2RequiredCell = nullptr;
+    delete[] this->globalVert2LocalVert;    this->globalVert2LocalVert    = nullptr;
+    delete[] this->cellCoord;               this->cellCoord               = nullptr;
+    delete[] this->vertexCoord;             this->vertexCoord             = nullptr;
+    delete[] this->verticesOnEdge;          this->verticesOnEdge          = nullptr;
+    if (!usingNormalVelocity) {
+        delete[] this->numVerticesOnCell;   this->numVerticesOnCell       = nullptr;
+        delete[] this->edgesOnCell;         this->edgesOnCell             = nullptr;
+    }
+
     return grid;
 }
 
@@ -609,9 +671,9 @@ void MPASOReader::InitSolutions(MPASOGrid* grid, Solution* &pSolution, Solution*
               << N - 1 << " of " << this->nTimestepsTotal
               << " timestep(s)." << std::endl;
 
-    this->buildRequiredCellSet();
-    this->computeCOVweights();
-    std::cout << "[MPASOReader::InitSolutions] Finished computing COV weights." << std::endl;
+    // Required cell set and COV weights are already built in CreateMPASOGrid.
+    assert(!this->requiredCellIndices.empty());
+    assert(this->cov_weights != nullptr);
 
     int nVertNodes = this->nLocalVertices * this->nVertLevels;
     VECTOR3** vertexVelocity     = new VECTOR3*[N];
@@ -1284,12 +1346,10 @@ void MPASOReader::readCellVelocity(int startTimestep, int N)
     assert(this->nVertLevels == static_cast<int>(dimlen2));
     assert(startTimestep + N <= this->nTimestepsInFile);
 
-    cellNodeNum = this->nTotalCells * this->nVertLevels;
+    assert(this->nRequiredCells > 0);
+    size_t compactNodeNum = static_cast<size_t>(this->nRequiredCells) * this->nVertLevels;
 
-    if (this->requiredCellIndices.empty())
-        this->buildRequiredCellSet();
-
-    // 5. free any previously loaded data and allocate N slots
+    // 5. free any previously loaded data and allocate N slots (compact size)
     if (this->cellVelocity != nullptr) {
         for (int t = 0; t < this->nTimestepsInMem; ++t)
             delete[] this->cellVelocity[t];
@@ -1298,55 +1358,55 @@ void MPASOReader::readCellVelocity(int startTimestep, int N)
     this->cellVelocity  = new VECTOR3*[N];
     this->nTimestepsInMem = N;
     for (int t = 0; t < N; ++t)
-        this->cellVelocity[t] = new VECTOR3[cellNodeNum];
+        this->cellVelocity[t] = new VECTOR3[compactNodeNum];
 
-    // 6. read N timesteps
+    // 6. read N timesteps using chunked hyperslabs (~1 GB cap per chunk)
+    const int chunkRows = pickRowChunkSize(this->nTotalCells, this->nVertLevels);
+    cellNodeNum = chunkRows * this->nVertLevels;
     cellVel_tmp = new double[cellNodeNum];
     count[0] = 1;
-    count[1] = this->nTotalCells;
     count[2] = this->nVertLevels;
-    start[1]  = 0;
-    start[2]  = 0;
+    start[2] = 0;
+
+    auto readAndScatter = [&](int varid, int t, int dim, int chunkStart, int chunkLen,
+                              int rcStart, int rcEnd) {
+        start[0] = startTimestep + t;
+        start[1] = chunkStart;
+        count[1] = chunkLen;
+        if ((retval = nc_get_vara_double(ncDataid, varid, start, count, cellVel_tmp))) {
+            std::cerr << "nc_get_vara_double velocity dim=" << dim << " t=" << start[0]
+                      << " chunkStart=" << chunkStart << " failed: " << nc_strerror(retval) << "\n";
+            std::exit(EXIT_FAILURE);
+        }
+        for (int r = rcStart; r < rcEnd; ++r) {
+            int gCellIdx = this->requiredCellIndices[r];
+            int srcOffset = (gCellIdx - chunkStart) * this->nVertLevels;
+            int dstOffset = r * this->nVertLevels;
+            for (int j = 0; j < this->nVertLevels; j++) {
+                double val = cellVel_tmp[srcOffset+j];
+                this->cellVelocity[t][dstOffset+j][dim] =
+                    (val > 1.0e30 || val < -1.0e30) ? 0.0 : val;
+            }
+        }
+    };
 
     for (int t = 0; t < N; ++t) {
-        start[0] = startTimestep + t;
+        int rc_cursor = 0;
+        for (int chunkStart = 0; chunkStart < this->nTotalCells; chunkStart += chunkRows) {
+            int chunkLen = std::min(chunkRows, this->nTotalCells - chunkStart);
+            int chunkEnd = chunkStart + chunkLen;
 
-        auto copyCartesianComponent = [&](int dim) {
-            if (!this->requiredCellIndices.empty()) {
-                for (int gCellIdx : this->requiredCellIndices) {
-                    int offset = gCellIdx * this->nVertLevels;
-                    for (int j = 0; j < this->nVertLevels; j++) {
-                        double val = cellVel_tmp[offset+j];
-                        this->cellVelocity[t][offset+j][dim] =
-                            (val > 1.0e30 || val < -1.0e30) ? 0.0 : val;
-                    }
-                }
-            } else {
-                for (int i = 0; i < cellNodeNum; ++i) {
-                    double val = cellVel_tmp[i];
-                    this->cellVelocity[t][i][dim] =
-                        (val > 1.0e30 || val < -1.0e30) ? 0.0 : val;
-                }
-            }
-        };
+            int rcStart = rc_cursor;
+            while (rc_cursor < this->nRequiredCells &&
+                   this->requiredCellIndices[rc_cursor] < chunkEnd)
+                rc_cursor++;
+            int rcEnd = rc_cursor;
+            if (rcStart == rcEnd) continue;  // no required cells in this chunk
 
-        if ((retval = nc_get_vara_double(ncDataid, velX_id, start, count, cellVel_tmp))) {
-            std::cerr << "nc_get_vara_double velocityX t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
-            std::exit(EXIT_FAILURE);
+            readAndScatter(velX_id, t, 0, chunkStart, chunkLen, rcStart, rcEnd);
+            readAndScatter(velY_id, t, 1, chunkStart, chunkLen, rcStart, rcEnd);
+            readAndScatter(velZ_id, t, 2, chunkStart, chunkLen, rcStart, rcEnd);
         }
-        copyCartesianComponent(0);
-
-        if ((retval = nc_get_vara_double(ncDataid, velY_id, start, count, cellVel_tmp))) {
-            std::cerr << "nc_get_vara_double velocityY t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
-            std::exit(EXIT_FAILURE);
-        }
-        copyCartesianComponent(1);
-
-        if ((retval = nc_get_vara_double(ncDataid, velZ_id, start, count, cellVel_tmp))) {
-            std::cerr << "nc_get_vara_double velocityZ t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
-            std::exit(EXIT_FAILURE);
-        }
-        copyCartesianComponent(2);
     }
 
     delete[] cellVel_tmp;
@@ -1417,12 +1477,10 @@ void MPASOReader::readZonMeridVelocity(int startTimestep, int N)
     assert(this->nVertLevels == static_cast<int>(dimlen2));
     assert(startTimestep + N <= this->nTimestepsInFile);
 
-    cellNodeNum = this->nTotalCells * this->nVertLevels;
+    assert(this->nRequiredCells > 0);
+    size_t compactNodeNum = static_cast<size_t>(this->nRequiredCells) * this->nVertLevels;
 
-    if (this->requiredCellIndices.empty())
-        this->buildRequiredCellSet();
-
-    // 5. free any previously loaded data and allocate N slots
+    // 5. free any previously loaded data and allocate N slots (compact)
     if (this->cellVelocity != nullptr) {
         for (int t = 0; t < this->nTimestepsInMem; ++t)
             delete[] this->cellVelocity[t];
@@ -1431,40 +1489,58 @@ void MPASOReader::readZonMeridVelocity(int startTimestep, int N)
     this->cellVelocity  = new VECTOR3*[N];
     this->nTimestepsInMem = N;
     for (int t = 0; t < N; ++t) {
-        this->cellVelocity[t] = new VECTOR3[cellNodeNum];
-        for (int i = 0; i < cellNodeNum; ++i)
+        this->cellVelocity[t] = new VECTOR3[compactNodeNum];
+        for (size_t i = 0; i < compactNodeNum; ++i)
             this->cellVelocity[t][i].Zero();
     }
 
-    // 6. read N timesteps
+    // 6. read N timesteps using chunked hyperslabs (~1 GB cap per chunk buffer)
+    const int chunkRows = pickRowChunkSize(this->nTotalCells, this->nVertLevels);
+    cellNodeNum = chunkRows * this->nVertLevels;
     cellZonVel_tmp = new double[cellNodeNum];
     cellMerVel_tmp = new double[cellNodeNum];
     count[0] = 1;
-    count[1] = this->nTotalCells;
     count[2] = this->nVertLevels;
-    start[1]  = 0;
-    start[2]  = 0;
+    start[2] = 0;
 
     for (int t = 0; t < N; ++t) {
-        start[0] = startTimestep + t;
+        int rc_cursor = 0;
+        for (int chunkStart = 0; chunkStart < this->nTotalCells; chunkStart += chunkRows) {
+            int chunkLen = std::min(chunkRows, this->nTotalCells - chunkStart);
+            int chunkEnd = chunkStart + chunkLen;
 
-        if ((retval = nc_get_vara_double(ncDataid, velZon_varid, start, count, cellZonVel_tmp))) {
-            std::cerr << "nc_get_vara_double zonal velocity t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
-            std::exit(EXIT_FAILURE);
-        }
-        if ((retval = nc_get_vara_double(ncDataid, velMer_varid, start, count, cellMerVel_tmp))) {
-            std::cerr << "nc_get_vara_double meridional velocity t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
-            std::exit(EXIT_FAILURE);
-        }
-        for (int gCellIdx : this->requiredCellIndices) {
-            int offset = gCellIdx * this->nVertLevels;
-            for (int j = 0; j < this->nVertLevels; j++) {
-                double uzon = cellZonVel_tmp[offset+j];
-                double umer = cellMerVel_tmp[offset+j];
-                // Mask out fill values (9.96921e+36) — land/dry cells have no valid velocity
-                if (uzon > 1.0e30 || uzon < -1.0e30) uzon = 0.0;
-                if (umer > 1.0e30 || umer < -1.0e30) umer = 0.0;
-                convertENUVelocityToXYZ(this->cellCoord[gCellIdx], uzon, umer, 0.0, this->cellVelocity[t][offset+j]);
+            int rcStart = rc_cursor;
+            while (rc_cursor < this->nRequiredCells &&
+                   this->requiredCellIndices[rc_cursor] < chunkEnd)
+                rc_cursor++;
+            int rcEnd = rc_cursor;
+            if (rcStart == rcEnd) continue;
+
+            start[0] = startTimestep + t;
+            start[1] = chunkStart;
+            count[1] = chunkLen;
+            if ((retval = nc_get_vara_double(ncDataid, velZon_varid, start, count, cellZonVel_tmp))) {
+                std::cerr << "nc_get_vara_double zonal velocity t=" << start[0]
+                          << " chunkStart=" << chunkStart << " failed: " << nc_strerror(retval) << "\n";
+                std::exit(EXIT_FAILURE);
+            }
+            if ((retval = nc_get_vara_double(ncDataid, velMer_varid, start, count, cellMerVel_tmp))) {
+                std::cerr << "nc_get_vara_double meridional velocity t=" << start[0]
+                          << " chunkStart=" << chunkStart << " failed: " << nc_strerror(retval) << "\n";
+                std::exit(EXIT_FAILURE);
+            }
+            for (int r = rcStart; r < rcEnd; ++r) {
+                int gCellIdx = this->requiredCellIndices[r];
+                int srcOffset = (gCellIdx - chunkStart) * this->nVertLevels;
+                int dstOffset = r * this->nVertLevels;
+                for (int j = 0; j < this->nVertLevels; j++) {
+                    double uzon = cellZonVel_tmp[srcOffset+j];
+                    double umer = cellMerVel_tmp[srcOffset+j];
+                    if (uzon > 1.0e30 || uzon < -1.0e30) uzon = 0.0;
+                    if (umer > 1.0e30 || umer < -1.0e30) umer = 0.0;
+                    convertENUVelocityToXYZ(this->requiredCellCoord[r], uzon, umer, 0.0,
+                                            this->cellVelocity[t][dstOffset+j]);
+                }
             }
         }
     }
@@ -1528,38 +1604,99 @@ void MPASOReader::readNormalVelocity(int startTimestep, int N) {
     assert(this->nVertLevels == static_cast<int>(dimlen2));
     assert(startTimestep + N <= this->nTimestepsInFile);
 
-    edgeNum = this->nTotalEdges * this->nVertLevels;
+    assert(this->nRequiredCells > 0);
+    assert(this->nMaxEdges > 0);
+    assert(this->numVerticesOnCell != nullptr);
+    assert(this->edgesOnCell       != nullptr);
 
-    if (this->requiredCellIndices.empty())
-        this->buildRequiredCellSet();
+    // Ensure edgeNormal is computed (normally done eagerly in CreateMPASOGrid)
+    this->computeEdgeNormalDirection();
+    assert(this->edgeNormal != nullptr);
 
-    // 5. free any previously loaded data and allocate N slots
+    // 5. free any previously loaded data and allocate N zeroed compact slots
     if (this->cellVelocity != nullptr) {
         for (int t = 0; t < this->nTimestepsInMem; ++t)
             delete[] this->cellVelocity[t];
         delete[] this->cellVelocity;
     }
+    size_t compactNodeNum = static_cast<size_t>(this->nRequiredCells) * this->nVertLevels;
     this->cellVelocity  = new VECTOR3*[N];
     this->nTimestepsInMem = N;
-    for (int t = 0; t < N; ++t)
-        this->cellVelocity[t] = nullptr;   // computeCellVelocity asserts nullptr and allocates
+    for (int t = 0; t < N; ++t) {
+        this->cellVelocity[t] = new VECTOR3[compactNodeNum];
+        for (size_t i = 0; i < compactNodeNum; ++i)
+            this->cellVelocity[t][i].Zero();
+    }
 
-    // 6. read N timesteps and convert each to cell-centered velocity
+    // 6. read N timesteps using chunked hyperslabs along the edge dimension (~1 GB cap)
+    constexpr double magic_number = 2.0; // from MPAS-Ocean doc
+    const int chunkRows = pickRowChunkSize(this->nTotalEdges, this->nVertLevels);
+    edgeNum = chunkRows * this->nVertLevels;
     edgeNormalVel_tmp = new double[edgeNum];
     count[0] = 1;
-    count[1] = this->nTotalEdges;
     count[2] = this->nVertLevels;
-    start[1]  = 0;
-    start[2]  = 0;
+    start[2] = 0;
 
     for (int t = 0; t < N; ++t) {
         start[0] = startTimestep + t;
-        if ((retval = nc_get_vara_double(ncDataid, normalVel_varid, start, count, edgeNormalVel_tmp))) {
-            std::cerr << "nc_get_vara_double normal velocity t=" << start[0] << " failed: " << nc_strerror(retval) << "\n";
-            std::exit(EXIT_FAILURE);
+
+        // Phase 1: for each edge chunk, accumulate contributions from edges in that chunk
+        for (int chunkStart = 0; chunkStart < this->nTotalEdges; chunkStart += chunkRows) {
+            int chunkLen = std::min(chunkRows, this->nTotalEdges - chunkStart);
+            int chunkEnd = chunkStart + chunkLen;
+
+            start[1] = chunkStart;
+            count[1] = chunkLen;
+            if ((retval = nc_get_vara_double(ncDataid, normalVel_varid, start, count, edgeNormalVel_tmp))) {
+                std::cerr << "nc_get_vara_double normal velocity t=" << start[0]
+                          << " chunkStart=" << chunkStart << " failed: " << nc_strerror(retval) << "\n";
+                std::exit(EXIT_FAILURE);
+            }
+
+            for (int rc = 0; rc < this->nRequiredCells; ++rc) {
+                int globalCellIdx = this->requiredCellIndices[rc];
+                int nVOC = this->numVerticesOnCell[globalCellIdx];
+                if (nVOC <= 0 || nVOC > this->nMaxEdges)
+                    throw std::runtime_error("numVerticesOnCell invalid: nVOC=" + std::to_string(nVOC) +
+                                             " for globalCellIdx=" + std::to_string(globalCellIdx));
+
+                size_t cellOffset = size_t(rc) * this->nVertLevels;
+                for (int j = 0; j < nVOC; ++j) {
+                    int edge1 = this->edgesOnCell[size_t(globalCellIdx) * this->nMaxEdges + j];
+                    if (edge1 <= 0)
+                        throw std::runtime_error("edgesOnCell has non-positive edge id at cell=" +
+                                                 std::to_string(globalCellIdx) + " j=" + std::to_string(j));
+                    int gEdgeIdx = edge1 - 1;
+                    if (gEdgeIdx < chunkStart || gEdgeIdx >= chunkEnd) continue;
+
+                    size_t edgeOffset = size_t(gEdgeIdx - chunkStart) * this->nVertLevels;
+                    const VECTOR3& en = this->edgeNormal[gEdgeIdx];
+                    for (int vl = 0; vl < this->nVertLevels; ++vl) {
+                        double vel = edgeNormalVel_tmp[edgeOffset + vl];
+                        if (vel > 1.0e30 || vel < -1.0e30) vel = 0.0;
+                        this->cellVelocity[t][cellOffset + vl][0] += vel * en[0];
+                        this->cellVelocity[t][cellOffset + vl][1] += vel * en[1];
+                        this->cellVelocity[t][cellOffset + vl][2] += vel * en[2];
+                    }
+                }
+            }
         }
-        std::cout << "[MPASOReader] Converting normal velocity t=" << start[0] << " to cell-centered velocity..." << std::endl;
-        this->computeCellVelocity(edgeNormalVel_tmp, this->cellVelocity[t]);
+
+        // Phase 2: finalize — scale each cell level by magic_number / nVOC
+        for (int rc = 0; rc < this->nRequiredCells; ++rc) {
+            int globalCellIdx = this->requiredCellIndices[rc];
+            int nVOC = this->numVerticesOnCell[globalCellIdx];
+            double scale = magic_number / double(nVOC);
+            size_t cellOffset = size_t(rc) * this->nVertLevels;
+            for (int vl = 0; vl < this->nVertLevels; ++vl) {
+                this->cellVelocity[t][cellOffset + vl][0] *= scale;
+                this->cellVelocity[t][cellOffset + vl][1] *= scale;
+                this->cellVelocity[t][cellOffset + vl][2] *= scale;
+            }
+        }
+
+        std::cout << "[MPASOReader] Converted normal velocity t=" << start[0]
+                  << " to cell-centered velocity." << std::endl;
     }
 
     delete[] edgeNormalVel_tmp;
@@ -1629,44 +1766,51 @@ void MPASOReader::readVertVelocityTop(int startTimestep, int N)
     }
     int totalBottomLevels = this->nVertLevelsP1 - 1;
     assert(totalBottomLevels == this->nVertLevels);
-    if (this->requiredCellIndices.empty())
-        this->buildRequiredCellSet();
+    assert(this->nRequiredCells > 0);
 
     this->cellVertVelocity  = new double*[N];
     this->nTimestepsInMem = N;
     for (int t = 0; t < N; ++t)
-        this->cellVertVelocity[t] = new double[this->nTotalCells * totalBottomLevels];
+        this->cellVertVelocity[t] = new double[static_cast<size_t>(this->nRequiredCells) * totalBottomLevels];
 
-    // 6. read N timesteps
-    vertVelocity_tmp = new double[this->nTotalCells * this->nVertLevelsP1];
+    // 6. read N timesteps using chunked hyperslabs (~1 GB cap per chunk)
+    const int chunkRows = pickRowChunkSize(this->nTotalCells, this->nVertLevelsP1);
+    vertVelocity_tmp = new double[static_cast<size_t>(chunkRows) * this->nVertLevelsP1];
     count[0] = 1;
-    count[1] = this->nTotalCells;
     count[2] = this->nVertLevelsP1;
-    start[1]  = 0;
-    start[2]  = 0;
+    start[2] = 0;
 
     for (int t = 0; t < N; ++t) {
-        start[0] = startTimestep + t;
-        if ((retval = nc_get_vara_double(ncDataid, varid, start, count, vertVelocity_tmp))) {
-            std::cerr << "nc_get_vara_double vertVelocityTop t=" << start[0] << " failed: "
-                      << nc_strerror(retval) << "\n";
-            std::exit(EXIT_FAILURE);
-        }
-        auto copyVertVelocity = [&](int gCellIdx) {
-            size_t offset   = static_cast<size_t>(gCellIdx) * totalBottomLevels;
-            size_t offsetp1 = static_cast<size_t>(gCellIdx) * this->nVertLevelsP1;
-            for (int v = 0; v < totalBottomLevels; ++v) {
-                double val = vertVelocity_tmp[offsetp1 + v];
-                this->cellVertVelocity[t][offset + v] = (val > 1.0e30 || val < -1.0e30) ? 0.0 : val;
-            }
-        };
+        int rc_cursor = 0;
+        for (int chunkStart = 0; chunkStart < this->nTotalCells; chunkStart += chunkRows) {
+            int chunkLen = std::min(chunkRows, this->nTotalCells - chunkStart);
+            int chunkEnd = chunkStart + chunkLen;
 
-        if (!this->requiredCellIndices.empty()) {
-            for (int gCellIdx : this->requiredCellIndices)
-                copyVertVelocity(gCellIdx);
-        } else {
-            for (int gCellIdx = 0; gCellIdx < this->nTotalCells; ++gCellIdx)
-                copyVertVelocity(gCellIdx);
+            int rcStart = rc_cursor;
+            while (rc_cursor < this->nRequiredCells &&
+                   this->requiredCellIndices[rc_cursor] < chunkEnd)
+                rc_cursor++;
+            int rcEnd = rc_cursor;
+            if (rcStart == rcEnd) continue;
+
+            start[0] = startTimestep + t;
+            start[1] = chunkStart;
+            count[1] = chunkLen;
+            if ((retval = nc_get_vara_double(ncDataid, varid, start, count, vertVelocity_tmp))) {
+                std::cerr << "nc_get_vara_double vertVelocityTop t=" << start[0]
+                          << " chunkStart=" << chunkStart << " failed: "
+                          << nc_strerror(retval) << "\n";
+                std::exit(EXIT_FAILURE);
+            }
+            for (int r = rcStart; r < rcEnd; ++r) {
+                int gCellIdx = this->requiredCellIndices[r];
+                size_t dstOffset = static_cast<size_t>(r) * totalBottomLevels;
+                size_t srcOffset = static_cast<size_t>(gCellIdx - chunkStart) * this->nVertLevelsP1;
+                for (int v = 0; v < totalBottomLevels; ++v) {
+                    double val = vertVelocity_tmp[srcOffset + v];
+                    this->cellVertVelocity[t][dstOffset + v] = (val > 1.0e30 || val < -1.0e30) ? 0.0 : val;
+                }
+            }
         }
     }
 
@@ -1727,22 +1871,46 @@ void MPASOReader::readZTop(int timestep)
     assert(this->nTotalCells == static_cast<int>(dimlen1));
     assert(this->nVertLevels == static_cast<int>(dimlen2));
 
-    // 5. Set up start and count vectors for reading
-    start[0] = timestep;               count[0] = 1;
-    start[1] = 0;                      count[1] = this->nTotalCells;
-    start[2] = 0;                      count[2] = this->nVertLevels;
-
-    // 6. Read zTop directly into cellZTop
-    size_t total = static_cast<size_t>(this->nTotalCells) * this->nVertLevels;
+    // 5. Read zTop in chunks; scatter into the compact cellZTop buffer
+    assert(this->nRequiredCells > 0);
+    size_t totalCompact = static_cast<size_t>(this->nRequiredCells) * this->nVertLevels;
     delete[] this->cellZTop;
-    this->cellZTop = new double[total];
-    if ((retval = nc_get_vara_double(ncDataid, varid,
-                                     start, count,
-                                     this->cellZTop))) {
-        std::cerr << "nc_get_vara_double zTop failed: "
-                  << nc_strerror(retval) << "\n";
-        std::exit(EXIT_FAILURE);
+    this->cellZTop = new double[totalCompact];
+
+    const int chunkRows = pickRowChunkSize(this->nTotalCells, this->nVertLevels);
+    double* zTop_tmp = new double[static_cast<size_t>(chunkRows) * this->nVertLevels];
+    count[0] = 1;
+    count[2] = this->nVertLevels;
+    start[0] = timestep;
+    start[2] = 0;
+
+    int rc_cursor = 0;
+    for (int chunkStart = 0; chunkStart < this->nTotalCells; chunkStart += chunkRows) {
+        int chunkLen = std::min(chunkRows, this->nTotalCells - chunkStart);
+        int chunkEnd = chunkStart + chunkLen;
+
+        int rcStart = rc_cursor;
+        while (rc_cursor < this->nRequiredCells &&
+               this->requiredCellIndices[rc_cursor] < chunkEnd)
+            rc_cursor++;
+        int rcEnd = rc_cursor;
+        if (rcStart == rcEnd) continue;
+
+        start[1] = chunkStart;
+        count[1] = chunkLen;
+        if ((retval = nc_get_vara_double(ncDataid, varid, start, count, zTop_tmp))) {
+            std::cerr << "nc_get_vara_double zTop chunkStart=" << chunkStart
+                      << " failed: " << nc_strerror(retval) << "\n";
+            std::exit(EXIT_FAILURE);
+        }
+        for (int r = rcStart; r < rcEnd; ++r) {
+            int gCellIdx = this->requiredCellIndices[r];
+            std::memcpy(&this->cellZTop[static_cast<size_t>(r) * this->nVertLevels],
+                        &zTop_tmp[static_cast<size_t>(gCellIdx - chunkStart) * this->nVertLevels],
+                        this->nVertLevels * sizeof(double));
+        }
     }
+    delete[] zTop_tmp;
 }
 
 void MPASOReader::readLayerThickness(int timestep)
@@ -1802,62 +1970,61 @@ void MPASOReader::readLayerThickness(int timestep)
     assert(this->nTotalCells == static_cast<int>(dimlen1));
     assert(this->nVertLevels == static_cast<int>(dimlen2));
 
-    // 5. Set up start and count vectors for reading
-    start[0] = timestep;                   count[0] = 1;
-    start[1] = 0;                          count[1] = this->nTotalCells;
-    start[2] = 0;                          count[2] = this->nVertLevels;
+    // 5. Read layerThickness in chunks; compute compact zTop directly
+    assert(this->nRequiredCells > 0);
+    assert(this->maxLevelRequiredCell    != nullptr);
+    assert(this->bottomDepthRequiredCell != nullptr);
 
-    // 6. Allocate memory for temporary layer thickness storage
-    size_t total = static_cast<size_t>(this->nTotalCells) * this->nVertLevels;
-    layerThickness_tmp = new double[total];
-    if ((retval = nc_get_vara_double(ncDataid, varid,
-                                     start, count,
-                                     layerThickness_tmp))) {
-        std::cerr << "nc_get_vara_double layerThickness failed: "
-                  << nc_strerror(retval) << "\n";
-        std::exit(EXIT_FAILURE);
-    }
-
-    // 7. Compute zTop from layerThickness when zTop is unavailable
+    size_t totalCompact = static_cast<size_t>(this->nRequiredCells) * this->nVertLevels;
     delete[] this->cellZTop;
-    if(this->maxLevelCell == nullptr)
-        this->readMaxLevelCell();
-    if(this->bottomDepth == nullptr)
-        this->readBottomDepth();
-    this->cellZTop = new double[total];
+    this->cellZTop = new double[totalCompact];
 
-    if (this->requiredCellIndices.empty() &&
-        this->nLocalVertices > 0 &&
-        this->localVert2GlobalVert != nullptr &&
-        this->cellsOnVertex != nullptr) {
-        this->buildRequiredCellSet();
-    }
+    const int chunkRows = pickRowChunkSize(this->nTotalCells, this->nVertLevels);
+    layerThickness_tmp = new double[static_cast<size_t>(chunkRows) * this->nVertLevels];
+    count[0] = 1;
+    count[2] = this->nVertLevels;
+    start[0] = timestep;
+    start[2] = 0;
 
-    auto computeCellZTop = [&](int gCellIdx) {
-        int offset = gCellIdx * this->nVertLevels;
-        int activeLevels = this->maxLevelCell[gCellIdx];
-        if(activeLevels < 0 || activeLevels > this->nVertLevels) {
-            std::cerr << "[MPASOReader] Invalid maxLevelCell[" << gCellIdx << "] = "
-                      << activeLevels << "\n";
+    int rc_cursor = 0;
+    for (int chunkStart = 0; chunkStart < this->nTotalCells; chunkStart += chunkRows) {
+        int chunkLen = std::min(chunkRows, this->nTotalCells - chunkStart);
+        int chunkEnd = chunkStart + chunkLen;
+
+        int rcStart = rc_cursor;
+        while (rc_cursor < this->nRequiredCells &&
+               this->requiredCellIndices[rc_cursor] < chunkEnd)
+            rc_cursor++;
+        int rcEnd = rc_cursor;
+        if (rcStart == rcEnd) continue;
+
+        start[1] = chunkStart;
+        count[1] = chunkLen;
+        if ((retval = nc_get_vara_double(ncDataid, varid, start, count, layerThickness_tmp))) {
+            std::cerr << "nc_get_vara_double layerThickness chunkStart=" << chunkStart
+                      << " failed: " << nc_strerror(retval) << "\n";
             std::exit(EXIT_FAILURE);
         }
-        double surface = -this->bottomDepth[gCellIdx];
-        for(int j = 0; j < activeLevels; j++)
-            surface += layerThickness_tmp[offset+j];
-        for(int j = 0; j < this->nVertLevels; j++) {
-            if(j == 0)
-                this->cellZTop[offset+j] = surface;
-            else
-                this->cellZTop[offset+j] = this->cellZTop[offset+j-1] - layerThickness_tmp[offset+j-1];
+        for (int r = rcStart; r < rcEnd; ++r) {
+            int gCellIdx = this->requiredCellIndices[r];
+            int srcOffset = (gCellIdx - chunkStart) * this->nVertLevels;
+            int dstOffset = r * this->nVertLevels;
+            int activeLevels = this->maxLevelRequiredCell[r];
+            if (activeLevels < 0 || activeLevels > this->nVertLevels) {
+                std::cerr << "[MPASOReader] Invalid maxLevelRequiredCell[" << r << "] = "
+                          << activeLevels << "\n";
+                std::exit(EXIT_FAILURE);
+            }
+            double surface = -this->bottomDepthRequiredCell[r];
+            for (int j = 0; j < activeLevels; j++)
+                surface += layerThickness_tmp[srcOffset+j];
+            for (int j = 0; j < this->nVertLevels; j++) {
+                if (j == 0)
+                    this->cellZTop[dstOffset+j] = surface;
+                else
+                    this->cellZTop[dstOffset+j] = this->cellZTop[dstOffset+j-1] - layerThickness_tmp[srcOffset+j-1];
+            }
         }
-    };
-
-    if (!this->requiredCellIndices.empty()) {
-        for (int gCellIdx : this->requiredCellIndices)
-            computeCellZTop(gCellIdx);
-    } else {
-        for (int gCellIdx = 0; gCellIdx < this->nTotalCells; gCellIdx++)
-            computeCellZTop(gCellIdx);
     }
 
     delete[] layerThickness_tmp;
@@ -1983,18 +2150,84 @@ void MPASOReader::buildRequiredCellSet()
               << " global cells are needed by local vertices." << std::endl;
 }
 
+void MPASOReader::buildCompactCellStructures()
+{
+    // Requires: requiredCellIndices (sorted), localVert2GlobalVert, cellsOnVertex,
+    //           cellCoord, maxLevelCell, bottomDepth still alive.
+    assert(!this->requiredCellIndices.empty());
+    assert(this->localVert2GlobalVert != nullptr);
+    assert(this->cellsOnVertex        != nullptr);
+    assert(this->cellCoord            != nullptr);
+    assert(this->maxLevelCell         != nullptr);
+    assert(this->bottomDepth          != nullptr);
+    assert(this->nLocalVertices > 0);
+    assert(this->verticesDegree > 0);
+
+    this->nRequiredCells = static_cast<int>(this->requiredCellIndices.size());
+
+    // 1. globalCell2RequiredCell
+    delete[] this->globalCell2RequiredCell;
+    this->globalCell2RequiredCell = new int[this->nTotalCells];
+    std::fill_n(this->globalCell2RequiredCell, this->nTotalCells, -1);
+    for (int rc = 0; rc < this->nRequiredCells; ++rc)
+        this->globalCell2RequiredCell[this->requiredCellIndices[rc]] = rc;
+
+    // 2. cellsOnLocalVertex (local-vertex -> required-cell idx per neighbor)
+    delete[] this->cellsOnLocalVertex;
+    this->cellsOnLocalVertex = new int[this->nLocalVertices * this->verticesDegree];
+    for (int lv = 0; lv < this->nLocalVertices; ++lv) {
+        int gVertIdx = this->localVert2GlobalVert[lv] - 1;
+        if (gVertIdx < 0 || gVertIdx >= this->nTotalVertices)
+            throw std::runtime_error("buildCompactCellStructures: gVertIdx out of range");
+        for (int i = 0; i < this->verticesDegree; ++i) {
+            int gCell1 = this->cellsOnVertex[gVertIdx * this->verticesDegree + i];
+            if (gCell1 <= 0) {
+                this->cellsOnLocalVertex[lv * this->verticesDegree + i] = -1;
+            } else {
+                int gCellIdx = gCell1 - 1;
+                int rc = this->globalCell2RequiredCell[gCellIdx];
+                assert(rc >= 0);  // required set already covers every cell touched here
+                this->cellsOnLocalVertex[lv * this->verticesDegree + i] = rc;
+            }
+        }
+    }
+
+    // 3. Compact per-required-cell arrays
+    delete[] this->requiredCellCoord;
+    this->requiredCellCoord = new VECTOR3[this->nRequiredCells];
+    delete[] this->maxLevelRequiredCell;
+    this->maxLevelRequiredCell = new int[this->nRequiredCells];
+    delete[] this->bottomDepthRequiredCell;
+    this->bottomDepthRequiredCell = new double[this->nRequiredCells];
+    for (int rc = 0; rc < this->nRequiredCells; ++rc) {
+        int gCellIdx = this->requiredCellIndices[rc];
+        this->requiredCellCoord[rc]      = this->cellCoord[gCellIdx];
+        this->maxLevelRequiredCell[rc]   = this->maxLevelCell[gCellIdx];
+        this->bottomDepthRequiredCell[rc]= this->bottomDepth[gCellIdx];
+    }
+
+    std::cout << "[MPASOReader] Compact cell structures built: "
+              << this->nRequiredCells << " required cells ("
+              << (100.0 * this->nRequiredCells / std::max(1, this->nTotalCells))
+              << "% of global)." << std::endl;
+}
+
 void MPASOReader::computeCOVweights()
 {
     assert(this->cov_weights == nullptr);
     assert(this->nLocalVertices > 0);
+    assert(this->cellsOnLocalVertex != nullptr);
+    assert(this->requiredCellCoord  != nullptr);
+    assert(this->verticesDegree == 3);
     this->cov_weights = new VECTOR3[this->nLocalVertices];
     for (int localVertIdx = 0; localVertIdx < this->nLocalVertices; localVertIdx++) {
         int gVertIdx = this->localVert2GlobalVert[localVertIdx] - 1;
-        int cellIndices[3];
+        int rcIndices[3] = {-1, -1, -1};
         int nNeighbers = 0;
         for (int i = 0; i < 3; i++) {
-            if (this->cellsOnVertex[gVertIdx*3 + i] > 0) {
-                cellIndices[i] = this->cellsOnVertex[gVertIdx*3 + i] - 1;
+            int rc = this->cellsOnLocalVertex[localVertIdx * 3 + i];
+            if (rc >= 0) {
+                rcIndices[i] = rc;
                 nNeighbers++;
             }
         }
@@ -2002,13 +2235,13 @@ void MPASOReader::computeCOVweights()
         if (nNeighbers <= 2) {
             this->cov_weights[localVertIdx].Zero();
         } else if (nNeighbers == 3) {
-            VECTOR3 diff1 = this->cellCoord[cellIndices[0]] - this->vertexCoord[gVertIdx];
-            VECTOR3 diff2 = this->cellCoord[cellIndices[1]] - this->vertexCoord[gVertIdx];
-            VECTOR3 diff3 = this->cellCoord[cellIndices[2]] - this->vertexCoord[gVertIdx];
+            VECTOR3 diff1 = this->requiredCellCoord[rcIndices[0]] - this->vertexCoord[gVertIdx];
+            VECTOR3 diff2 = this->requiredCellCoord[rcIndices[1]] - this->vertexCoord[gVertIdx];
+            VECTOR3 diff3 = this->requiredCellCoord[rcIndices[2]] - this->vertexCoord[gVertIdx];
 
-            VECTOR3 diff12 = this->cellCoord[cellIndices[1]] - this->cellCoord[cellIndices[0]];
-            VECTOR3 diff23 = this->cellCoord[cellIndices[2]] - this->cellCoord[cellIndices[1]];
-            VECTOR3 diff31 = this->cellCoord[cellIndices[0]] - this->cellCoord[cellIndices[2]];
+            VECTOR3 diff12 = this->requiredCellCoord[rcIndices[1]] - this->requiredCellCoord[rcIndices[0]];
+            VECTOR3 diff23 = this->requiredCellCoord[rcIndices[2]] - this->requiredCellCoord[rcIndices[1]];
+            VECTOR3 diff31 = this->requiredCellCoord[rcIndices[0]] - this->requiredCellCoord[rcIndices[2]];
 
             double dist1 = diff1.GetMag();
             double dist2 = diff2.GetMag();
@@ -2043,9 +2276,7 @@ void MPASOReader::computeEdgeNormalDirection()
     assert(this->nTotalEdges > 0);
     assert(this->nTotalCells > 0);
     assert(this->nMaxEdges > 0);
-
-    if (this->requiredCellIndices.empty())
-        this->buildRequiredCellSet();
+    assert(!this->requiredCellIndices.empty());
 
     // 1) Initialize
     this->edgeNormal = new VECTOR3[this->nTotalEdges];
@@ -2099,71 +2330,6 @@ void MPASOReader::computeEdgeNormalDirection()
     this->edgeNormalComputed = true;
 }
 
-void MPASOReader::computeCellVelocity(double* normalVelocity, VECTOR3*& cellVelocity)
-{
-    std::cout << "Compute cell velocity from edge normal velocity\n";
-
-    this->computeEdgeNormalDirection();
-
-    assert(cellVelocity == nullptr);
-    assert(this->nLocalCells > 0 && this->nVertLevels > 0);
-    assert(this->nMaxEdges > 0);
-    assert(this->localCell2GlobalCell != nullptr);
-    assert(this->numVerticesOnCell    != nullptr);
-    assert(this->edgesOnCell          != nullptr);
-    assert(this->edgeNormal           != nullptr);
-    assert(normalVelocity             != nullptr);
-    assert(this->nTotalEdges > 0);
-
-    cellVelocity = new VECTOR3[this->nTotalCells * this->nVertLevels];
-    for (int i = 0; i < this->nTotalCells * this->nVertLevels; ++i)
-        cellVelocity[i].Zero();
-
-    constexpr double magic_number = 2.0; // from MPAS-Ocean doc
-
-    auto accumulateCellVelocity = [&](int globalCellIdx) {
-        int nVOC = this->numVerticesOnCell[globalCellIdx];
-        if (nVOC <= 0 || nVOC > this->nMaxEdges)
-            throw std::runtime_error("numVerticesOnCell invalid: nVOC=" + std::to_string(nVOC) +
-                                     " for globalCellIdx=" + std::to_string(globalCellIdx));
-
-        size_t cellOffset = size_t(globalCellIdx) * this->nVertLevels;
-
-        for (int vl = 0; vl < this->nVertLevels; ++vl) {
-            VECTOR3 acc{0,0,0};
-
-            for (int j = 0; j < nVOC; ++j) {
-                int edge1 = this->edgesOnCell[size_t(globalCellIdx) * this->nMaxEdges + j];
-                if (edge1 <= 0)
-                    throw std::runtime_error("edgesOnCell has non-positive edge id at cell=" +
-                                             std::to_string(globalCellIdx) + " j=" + std::to_string(j));
-                int gEdgeIdx = edge1 - 1;
-                if (gEdgeIdx < 0 || gEdgeIdx >= this->nTotalEdges)
-                    throw std::runtime_error("gEdgeIdx out of range: " + std::to_string(gEdgeIdx));
-
-                size_t edgeOffset = size_t(gEdgeIdx) * this->nVertLevels;
-                double vel = normalVelocity[edgeOffset + vl];
-                if (vel > 1.0e30 || vel < -1.0e30) vel = 0.0; // mask fill values
-
-                acc[0] += vel * this->edgeNormal[gEdgeIdx][0];
-                acc[1] += vel * this->edgeNormal[gEdgeIdx][1];
-                acc[2] += vel * this->edgeNormal[gEdgeIdx][2];
-            }
-
-            acc.scale(magic_number / double(nVOC));
-            cellVelocity[cellOffset + vl] = acc;
-        }
-    };
-
-    if (!this->requiredCellIndices.empty()) {
-        for (int globalCellIdx : this->requiredCellIndices)
-            accumulateCellVelocity(globalCellIdx);
-    } else {
-        for (int globalCellIdx = 0; globalCellIdx < this->nTotalCells; ++globalCellIdx)
-            accumulateCellVelocity(globalCellIdx);
-    }
-}
-
 void MPASOReader::computeTimeVaryingVar(int localVertIdx,
                                         VECTOR3* cellVelocity, double* cellVertVelocity,
                                         double* cellZTop,
@@ -2182,14 +2348,14 @@ void MPASOReader::computeTimeVaryingVar(int localVertIdx,
             ztopOut[vl] = 0.0;
         }
     } else {
-        int gVertIdx = this->localVert2GlobalVert[localVertIdx] - 1;
-        int cellIndices[3];
-        for (int i = 0; i < 3; i++)
-            cellIndices[i] = this->cellsOnVertex[gVertIdx*3 + i] - 1;
+        // Compact required-cell indices (cov_weights is non-zero => all 3 neighbors valid)
+        int rc0 = this->cellsOnLocalVertex[localVertIdx * 3 + 0];
+        int rc1 = this->cellsOnLocalVertex[localVertIdx * 3 + 1];
+        int rc2 = this->cellsOnLocalVertex[localVertIdx * 3 + 2];
 
-        int c1offset = cellIndices[0] * this->nVertLevels;
-        int c2offset = cellIndices[1] * this->nVertLevels;
-        int c3offset = cellIndices[2] * this->nVertLevels;
+        int c1offset = rc0 * this->nVertLevels;
+        int c2offset = rc1 * this->nVertLevels;
+        int c3offset = rc2 * this->nVertLevels;
         VECTOR3 w = this->cov_weights[localVertIdx];
         for (int vl = 0; vl < this->nVertLevels; vl++) {
             vVelocityOut[vl].Zero();

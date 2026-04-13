@@ -92,6 +92,16 @@ private:
     VECTOR3* cov_weights = nullptr;
     std::vector<int> requiredCellIndices;
 
+    // Compact cell-space structures (built in CreateMPASOGrid)
+    // Time-varying cell arrays (cellVelocity/cellVertVelocity/cellZTop) are allocated
+    // as nRequiredCells * nVertLevels and indexed by required-cell idx, not global.
+    int nRequiredCells = 0;
+    int* globalCell2RequiredCell = nullptr;   // size nTotalCells, -1 if not required
+    int* cellsOnLocalVertex      = nullptr;   // size nLocalVertices * verticesDegree, required-cell idx or -1
+    VECTOR3* requiredCellCoord      = nullptr;// size nRequiredCells
+    int*     maxLevelRequiredCell   = nullptr;// size nRequiredCells
+    double*  bottomDepthRequiredCell= nullptr;// size nRequiredCells
+
     // Edge normal directions (computed once from mesh topology)
     VECTOR3* edgeNormal = nullptr;
     bool edgeNormalComputed = false;
@@ -167,9 +177,9 @@ private:
                                     double* vertexZTop);
     void appendTimestampsFromNcid(int ncid, double& t0, bool isFirst);  // parse xtime into m_fileTimestamps
     void buildRequiredCellSet();
+    void buildCompactCellStructures();
     void computeCOVweights();
     void computeEdgeNormalDirection();
-    void computeCellVelocity(double* normalVelocity, VECTOR3*& cellVelocity);
     void computeTimeVaryingVar(int localVertIdx,
                                VECTOR3* cellVelocity, double* cellVertVelocity,
                                double* cellZTop,

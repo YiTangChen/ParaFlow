@@ -2,8 +2,8 @@ enable_timing: true
 outputDir: pathlines
 
 maxsteps: 20000000
-record_interval: 180
-dt: 10.0
+record_interval: 30
+dt: 60.0
 nproc: 256
 nblocks: 256
 meshfile_src: null
