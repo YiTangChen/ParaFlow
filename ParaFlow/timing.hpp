@@ -2,43 +2,61 @@
 #define _TIMING_HPP
 
 #include <mpi.h>
+#include <time.h>
 #include <fstream>
 #include <string>
 #include <cstdio>
 
 // Per-block timing accumulators (stored in each Block instance). All times are in seconds.
 struct BlockTiming {
-    // Initialization phase
-    double t_block_load         = 0.0;  // set_data: NetCDF read + seed filter
+    // ── Initialization phase ──────────────────────────────────────────────────
+    double t_block_load         = 0.0;  // set_data total (= t_netcdf_read + t_seed_filter)
+    double t_netcdf_read        = 0.0;  // LoadMPASOData: NetCDF I/O + mesh topology build
+    double t_seed_filter        = 0.0;  // inBlock() scan over all broadcast seeds
 
-    // Tracing phase (accumulated over all iexchange loop iterations)
+    // ── Tracing phase (accumulated over all iexchange rounds) ─────────────────
     double t_trace_compute      = 0.0;  // GenStreamLines / GenPathLines (RK4 integration)
+    double t_trace_enqueue      = 0.0;  // Segment build + cp.enqueue() after each trace round
     double t_trace_comm         = 0.0;  // deq_incoming_iexchange (receive particles)
+    double t_fill_incoming      = 0.0;  // cp.fill_incoming() wait — true network/idle time
 
-    // Output phase
+    // ── Output phase ─────────────────────────────────────────────────────────
     double t_output_write       = 0.0;  // write_trajectory
 
-    // Work counters (useful for normalizing time and detecting load imbalance)
+    // ── Work counters ─────────────────────────────────────────────────────────
+    int    n_iex_rounds         = 0;    // iexchange do-while iterations (for per-round averages)
     int    n_seeds_initial      = 0;    // seeds assigned to this block at startup
     long   n_steps_total        = 0;    // total RK4 integration steps completed
     int    n_particles_received = 0;    // particles received from neighbor blocks
+    int    n_particles_sent     = 0;    // particles forwarded to neighbor blocks
 
-    // Memory measurements (computed once at init, analytical formula)
+    // ── Memory measurements (analytical formula) ──────────────────────────────
     size_t mem_grid_bytes       = 0;    // MPASOGrid: topology arrays + coordinates
     size_t mem_solution_bytes   = 0;    // Solution: velocity field data (scales with timesteps)
 
-    // Memory measurements (OS-reported, from /proc/self/status)
+    // ── Memory measurements (OS-reported, from /proc/self/status) ────────────
     long   mem_vmrss_before_kb  = 0;    // VmRSS before set_data (kB)
     long   mem_vmrss_after_kb   = 0;    // VmRSS after  set_data (kB)
     long   mem_peak_vmhwm_kb    = 0;    // VmHWM peak after tracing (kB)
 };
 
+// Use clock_gettime(CLOCK_MONOTONIC) instead of MPI_Wtime().
+// On Linux this is a vDSO call (~3-10 ns) vs MPI_Wtime (~100-200 ns).
+// The difference matters when pf_now/pf_accum are called thousands of times
+// per block in tight iexchange loops — especially with small seed counts where
+// total compute time may be only a few milliseconds.
 inline double pf_now(bool enabled) {
-    return enabled ? MPI_Wtime() : 0.0;
+    if (!enabled) return 0.0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
 inline void pf_accum(double& acc, double start, bool enabled) {
-    if (enabled) acc += MPI_Wtime() - start;
+    if (!enabled) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    acc += ((double)ts.tv_sec + (double)ts.tv_nsec * 1e-9) - start;
 }
 
 inline long pf_read_vmrss_kb() {

@@ -255,7 +255,6 @@ def plot_scaling(valid):
         eff = (t0 * p0) / (df.t_iex_max * df.n_blocks)
         ax.plot(df.n_blocks, eff, "o-", color=sc[i], label=f"{ns:,} seeds")
     ax.axhline(1.0, color="black", linestyle="--", linewidth=1,   label="Ideal (100%)")
-    ax.axhline(0.7, color="red",   linestyle=":",  linewidth=1.2, label="70% threshold")
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.set_xticks(block_counts)
