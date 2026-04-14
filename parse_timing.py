@@ -41,25 +41,34 @@ BLOCK_CSV      = RESULTS_DIR / "block_detail.csv"
 SUMMARY_FIELDS = [
     "n_blocks", "n_seeds", "run_id",
     "t_seed_read",
-    "t_seed_bcast_min", "t_seed_bcast_max", "t_seed_bcast_avg",
-    "t_blockload_min",  "t_blockload_max",  "t_blockload_avg",
-    "t_compute_min",    "t_compute_max",    "t_compute_avg",
-    "t_comm_min",       "t_comm_max",       "t_comm_avg",
-    "t_write_min",      "t_write_max",      "t_write_avg",
-    "t_iex_min",        "t_iex_max",        "t_iex_avg",
+    "t_seed_bcast_min",        "t_seed_bcast_max",        "t_seed_bcast_avg",
+    "t_blockload_min",         "t_blockload_max",         "t_blockload_avg",
+    "t_netcdf_min",            "t_netcdf_max",            "t_netcdf_avg",
+    "t_filter_min",            "t_filter_max",            "t_filter_avg",
+    "t_compute_min",           "t_compute_max",           "t_compute_avg",
+    "t_enqueue_min",           "t_enqueue_max",           "t_enqueue_avg",
+    "t_comm_min",              "t_comm_max",              "t_comm_avg",
+    "t_fill_incoming_min",     "t_fill_incoming_max",     "t_fill_incoming_avg",
+    "t_write_min",             "t_write_max",             "t_write_avg",
+    "t_iex_min",               "t_iex_max",               "t_iex_avg",
     "iex_imbalance",
     "mem_grid_bytes_min",      "mem_grid_bytes_max",      "mem_grid_bytes_avg",
     "mem_solution_bytes_min",  "mem_solution_bytes_max",  "mem_solution_bytes_avg",
     "mem_delta_kb_min",        "mem_delta_kb_max",        "mem_delta_kb_avg",
     "mem_peak_vmhwm_kb_min",   "mem_peak_vmhwm_kb_max",  "mem_peak_vmhwm_kb_avg",
-    "total_seeds_assigned",    "total_steps",             "total_particles_received",
+    "total_seeds_assigned",    "total_steps",
+    "total_particles_received", "total_particles_sent",
+    "total_iex_rounds",
 ]
 
 BLOCK_FIELDS = [
     "n_blocks", "n_seeds", "run_id", "gid", "rank",
-    "t_block_load", "t_trace_compute", "t_trace_comm", "t_output_write",
-    "t_trace_idle",          # derived: t_iex_total_rank - t_compute - t_comm
-    "n_seeds_initial", "n_steps_total", "n_particles_received",
+    "t_block_load", "t_netcdf_read", "t_seed_filter",
+    "t_trace_compute", "t_trace_enqueue", "t_trace_comm", "t_fill_incoming",
+    "t_output_write",
+    "t_trace_idle",          # derived: t_iex_total_rank - compute - enqueue - comm - fill
+    "n_iex_rounds", "n_seeds_initial", "n_steps_total",
+    "n_particles_received", "n_particles_sent",
     "mem_grid_bytes", "mem_solution_bytes", "mem_total_bytes",
     "mem_delta_kb", "mem_peak_vmhwm_kb",
 ]
@@ -109,22 +118,31 @@ def parse_log(path: str):
                 iex_totals.append((int(kv.get("rank", 0)), float(kv.get("t", 0))))
 
             # ── per-block lines ────────────────────────────────────────────
-            elif phase in ("block_load", "trace_compute", "trace_comm", "output_write"):
+            elif phase in ("block_load", "trace_compute", "trace_comm",
+                           "trace_enqueue", "fill_incoming", "output_write"):
                 gid = int(kv.get("gid", -1))
                 b   = blocks[gid]
                 b["gid"]  = gid
                 b["rank"] = int(kv.get("rank", 0))
                 if phase == "block_load":
-                    b["t_block_load"]   = float(kv.get("t", 0))
+                    b["t_block_load"]    = float(kv.get("t", 0))
                     b["n_seeds_initial"] = int(kv.get("nseeds", 0))
+                    b["t_netcdf_read"]   = float(kv.get("t_netcdf", 0))
+                    b["t_seed_filter"]   = float(kv.get("t_filter", 0))
                 elif phase == "trace_compute":
                     b["t_trace_compute"]      = float(kv.get("t", 0))
                     b["n_steps_total"]        = int(kv.get("nsteps", 0))
                     b["n_particles_received"] = int(kv.get("nrecv", 0))
+                    b["n_particles_sent"]     = int(kv.get("nsent", 0))
+                    b["n_iex_rounds"]         = int(kv.get("rounds", 0))
                 elif phase == "trace_comm":
-                    b["t_trace_comm"] = float(kv.get("t", 0))
+                    b["t_trace_comm"]    = float(kv.get("t", 0))
+                elif phase == "trace_enqueue":
+                    b["t_trace_enqueue"] = float(kv.get("t", 0))
+                elif phase == "fill_incoming":
+                    b["t_fill_incoming"] = float(kv.get("t", 0))
                 elif phase == "output_write":
-                    b["t_output_write"] = float(kv.get("t", 0))
+                    b["t_output_write"]  = float(kv.get("t", 0))
 
             # ── memory lines ───────────────────────────────────────────────
             elif line.startswith("MEM_ANALYTICAL"):
@@ -181,21 +199,34 @@ def build_summary_row(n_blocks, n_seeds, run_id, global_timing, blocks):
     def col(field):
         return [b.get(field, 0) for b in bdata]
 
+    def s3(field):
+        return dict(zip(
+            [f"t_{field}_min", f"t_{field}_max", f"t_{field}_avg"],
+            _stats(col(f"t_{field}"))))
+
     bcasts = global_timing.get("seed_bcasts", [])
     bc_min, bc_max, bc_avg = _stats(bcasts)
-    bl_min, bl_max, bl_avg = _stats(col("t_block_load"))
-    co_min, co_max, co_avg = _stats(col("t_trace_compute"))
-    cm_min, cm_max, cm_avg = _stats(col("t_trace_comm"))
-    wr_min, wr_max, wr_avg = _stats(col("t_output_write"))
 
     return {
         "n_blocks": n_blocks, "n_seeds": n_seeds, "run_id": run_id,
-        "t_seed_read":        global_timing.get("t_seed_read", 0),
+        "t_seed_read": global_timing.get("t_seed_read", 0),
         "t_seed_bcast_min": bc_min, "t_seed_bcast_max": bc_max, "t_seed_bcast_avg": bc_avg,
-        "t_blockload_min":  bl_min, "t_blockload_max":  bl_max, "t_blockload_avg":  bl_avg,
-        "t_compute_min":    co_min, "t_compute_max":    co_max, "t_compute_avg":    co_avg,
-        "t_comm_min":       cm_min, "t_comm_max":       cm_max, "t_comm_avg":       cm_avg,
-        "t_write_min":      wr_min, "t_write_max":      wr_max, "t_write_avg":      wr_avg,
+        **dict(zip(["t_blockload_min",     "t_blockload_max",     "t_blockload_avg"],
+                   _stats(col("t_block_load")))),
+        **dict(zip(["t_netcdf_min",        "t_netcdf_max",        "t_netcdf_avg"],
+                   _stats(col("t_netcdf_read")))),
+        **dict(zip(["t_filter_min",        "t_filter_max",        "t_filter_avg"],
+                   _stats(col("t_seed_filter")))),
+        **dict(zip(["t_compute_min",       "t_compute_max",       "t_compute_avg"],
+                   _stats(col("t_trace_compute")))),
+        **dict(zip(["t_enqueue_min",       "t_enqueue_max",       "t_enqueue_avg"],
+                   _stats(col("t_trace_enqueue")))),
+        **dict(zip(["t_comm_min",          "t_comm_max",          "t_comm_avg"],
+                   _stats(col("t_trace_comm")))),
+        **dict(zip(["t_fill_incoming_min", "t_fill_incoming_max", "t_fill_incoming_avg"],
+                   _stats(col("t_fill_incoming")))),
+        **dict(zip(["t_write_min",         "t_write_max",         "t_write_avg"],
+                   _stats(col("t_output_write")))),
         "t_iex_min":     global_timing.get("iex_min", 0),
         "t_iex_max":     global_timing.get("iex_max", 0),
         "t_iex_avg":     global_timing.get("iex_avg", 0),
@@ -212,31 +243,44 @@ def build_summary_row(n_blocks, n_seeds, run_id, global_timing, blocks):
         **dict(zip(
             ["mem_peak_vmhwm_kb_min",  "mem_peak_vmhwm_kb_max",  "mem_peak_vmhwm_kb_avg"],
             _stats(col("mem_peak_vmhwm_kb")))),
-        "total_seeds_assigned":     sum(col("n_seeds_initial")),
-        "total_steps":              sum(col("n_steps_total")),
-        "total_particles_received": sum(col("n_particles_received")),
+        "total_seeds_assigned":      sum(col("n_seeds_initial")),
+        "total_steps":               sum(col("n_steps_total")),
+        "total_particles_received":  sum(col("n_particles_received")),
+        "total_particles_sent":      sum(col("n_particles_sent")),
+        "total_iex_rounds":          sum(col("n_iex_rounds")),
     }
 
 
 def build_block_rows(n_blocks, n_seeds, run_id, blocks):
     rows = []
     for gid, b in sorted(blocks.items()):
-        t_comp = b.get("t_trace_compute", 0.0)
-        t_comm = b.get("t_trace_comm",    0.0)
-        t_iex  = b.get("t_iex_rank",      0.0)
-        t_idle = max(0.0, t_iex - t_comp - t_comm)   # derived
+        t_comp  = b.get("t_trace_compute",  0.0)
+        t_enq   = b.get("t_trace_enqueue",  0.0)
+        t_comm  = b.get("t_trace_comm",     0.0)
+        t_fill  = b.get("t_fill_incoming",  0.0)
+        t_iex   = b.get("t_iex_rank",       0.0)
+        # t_trace_idle = wall time inside iexchange not captured by any phase.
+        # Previously this absorbed the untimed enqueue loop and fill_incoming;
+        # with the new instrumentation it should be close to zero.
+        t_idle  = max(0.0, t_iex - t_comp - t_enq - t_comm - t_fill)
         rows.append({
             "n_blocks": n_blocks, "n_seeds": n_seeds, "run_id": run_id,
             "gid":  gid,
             "rank": b.get("rank", 0),
-            "t_block_load":    b.get("t_block_load",   0.0),
-            "t_trace_compute": t_comp,
-            "t_trace_comm":    t_comm,
-            "t_output_write":  b.get("t_output_write", 0.0),
-            "t_trace_idle":    t_idle,
-            "n_seeds_initial":      b.get("n_seeds_initial",      0),
-            "n_steps_total":        b.get("n_steps_total",        0),
-            "n_particles_received": b.get("n_particles_received", 0),
+            "t_block_load":     b.get("t_block_load",    0.0),
+            "t_netcdf_read":    b.get("t_netcdf_read",   0.0),
+            "t_seed_filter":    b.get("t_seed_filter",   0.0),
+            "t_trace_compute":  t_comp,
+            "t_trace_enqueue":  t_enq,
+            "t_trace_comm":     t_comm,
+            "t_fill_incoming":  t_fill,
+            "t_output_write":   b.get("t_output_write",  0.0),
+            "t_trace_idle":     t_idle,
+            "n_iex_rounds":          b.get("n_iex_rounds",          0),
+            "n_seeds_initial":       b.get("n_seeds_initial",       0),
+            "n_steps_total":         b.get("n_steps_total",         0),
+            "n_particles_received":  b.get("n_particles_received",  0),
+            "n_particles_sent":      b.get("n_particles_sent",      0),
             "mem_grid_bytes":     b.get("mem_grid_bytes",     0),
             "mem_solution_bytes": b.get("mem_solution_bytes", 0),
             "mem_total_bytes":    b.get("mem_grid_bytes", 0) + b.get("mem_solution_bytes", 0),

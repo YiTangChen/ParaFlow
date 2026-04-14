@@ -199,80 +199,98 @@ void ParaFlow::trace_block(Block*                               b,
 {
     diy::Link* l = cp.link();
 
-    do
+    // Restructured from do-while so that fill_incoming() can be timed.
+    // Each iteration of this loop is one iexchange round.
+    while (true)
     {
+        // ── Receive incoming particles from neighbours ────────────────────────
         double _t_comm = pf_now(enable_timing);
         this->deq_incoming_iexchange(b, cp);
         pf_accum(b->timing.t_trace_comm, _t_comm, enable_timing);
 
-        if(b->currentSeeds.size() == 0)
-            continue;
-        // std::cerr << "[rank " << b->rank << ", gid " << cp.gid() << "] Tracing " << b->currentSeeds.size() << " seeds\n";
-        int maxRemaining = 0;
-        for (auto& pt : b->startPts)
-            maxRemaining = std::max(maxRemaining, this->max_steps - pt.nsteps);
+        if (b->currentSeeds.size() > 0)
+        {
+            // ── RK4 integration ───────────────────────────────────────────────
+            // std::cerr << "[rank " << b->rank << ", gid " << cp.gid() << "] Tracing " << b->currentSeeds.size() << " seeds\n";
+            int maxRemaining = 0;
+            for (auto& pt : b->startPts)
+                maxRemaining = std::max(maxRemaining, this->max_steps - pt.nsteps);
 
-        double _t_comp = pf_now(enable_timing);
-        b->GenStreamLineByOSUFlow(maxRemaining, this->interval);
-        pf_accum(b->timing.t_trace_compute, _t_comp, enable_timing);
-        if (enable_timing)
-            for (auto s : b->sl_stepcounts) b->timing.n_steps_total += s;
-        // deal with current seeds
-        int sent = 0;
-        int seedCnt = 0;
-        for(auto sl = b->sl_list.begin(); sl != b->sl_list.end(); sl++) {
-            vtListSeedTrace * trace = *sl;
-            bool finished = false;
+            double _t_comp = pf_now(enable_timing);
+            b->GenStreamLineByOSUFlow(maxRemaining, this->interval);
+            pf_accum(b->timing.t_trace_compute, _t_comp, enable_timing);
+            if (enable_timing)
+                for (auto s : b->sl_stepcounts) b->timing.n_steps_total += s;
 
-            Segment currseg;
-            currseg.gid = b->startPts[seedCnt].gid;
-            currseg.pid = b->startPts[seedCnt].pid;
-            currseg.sid = b->startPts[seedCnt].sid;
-            currseg.nsteps = b->startPts[seedCnt].nsteps;
-            // Collect already-downsampled coords from OSUFlow
-            for(auto pIt = trace->begin(); pIt != trace->end(); pIt++) {
-                VECTOR3 tmp;
-                for (size_t i = 0; i < 3; i++)
-                    tmp[i] = (**pIt)[i];
-                currseg.coords.push_back(tmp);
-            }
-            // Use actual step count reported by OSUFlow (interval-aware)
-            if (seedCnt < (int)b->sl_stepcounts.size())
-                currseg.nsteps += b->sl_stepcounts[seedCnt];
+            // ── Segment build + enqueue outgoing particles ────────────────────
+            // Previously untimed: this loop copies trace coords into Segment
+            // objects and calls cp.enqueue() for every particle that exits the
+            // block.  For large seed counts the coord copies are non-trivial;
+            // for small counts this reveals the per-round enqueue overhead.
+            double _t_enq = pf_now(enable_timing);
+            int sent = 0;
+            int seedCnt = 0;
+            for(auto sl = b->sl_list.begin(); sl != b->sl_list.end(); sl++) {
+                vtListSeedTrace* trace = *sl;
 
-            if(currseg.nsteps >= this->max_steps)
-                finished = true;
-
-            // skip seeds that were out of boundary from the start
-            if(currseg.coords.empty()) {
-                seedCnt++;
-                continue;
-            }
-
-            int nextNeighborId = b->GetNeighborId(b->toCells[seedCnt]);
-
-            b->segs.push_back(currseg);
-
-            if(!finished) {
-                PtInfo endPt;
-                for(int i = 0; i < 3; i++)
-                    endPt.coord[i] = currseg.coords.back()[i];
-                endPt.gid = currseg.gid;
-                endPt.pid = currseg.pid;
-                endPt.sid = currseg.sid + 1;
-                endPt.nsteps = currseg.nsteps;
-                endPt.fromCell = b->GetGlobalCellidx(b->toCells[seedCnt]);
-
-                if(nextNeighborId >= 0) {
-                    diy::BlockID bid = l->target(nextNeighborId); // in case of multiple dests, send to first dest only
-                    cp.enqueue(bid, endPt);
-                    sent++;
+                Segment currseg;
+                currseg.gid    = b->startPts[seedCnt].gid;
+                currseg.pid    = b->startPts[seedCnt].pid;
+                currseg.sid    = b->startPts[seedCnt].sid;
+                currseg.nsteps = b->startPts[seedCnt].nsteps;
+                for(auto pIt = trace->begin(); pIt != trace->end(); pIt++) {
+                    VECTOR3 tmp;
+                    for (size_t i = 0; i < 3; i++)
+                        tmp[i] = (**pIt)[i];
+                    currseg.coords.push_back(tmp);
                 }
+                if (seedCnt < (int)b->sl_stepcounts.size())
+                    currseg.nsteps += b->sl_stepcounts[seedCnt];
+
+                bool finished = (currseg.nsteps >= this->max_steps);
+
+                if(currseg.coords.empty()) {
+                    seedCnt++;
+                    continue;
+                }
+
+                int nextNeighborId = b->GetNeighborId(b->toCells[seedCnt]);
+                b->segs.push_back(currseg);
+
+                if(!finished) {
+                    PtInfo endPt;
+                    for(int i = 0; i < 3; i++)
+                        endPt.coord[i] = currseg.coords.back()[i];
+                    endPt.gid      = currseg.gid;
+                    endPt.pid      = currseg.pid;
+                    endPt.sid      = currseg.sid + 1;
+                    endPt.nsteps   = currseg.nsteps;
+                    endPt.fromCell = b->GetGlobalCellidx(b->toCells[seedCnt]);
+
+                    if(nextNeighborId >= 0) {
+                        diy::BlockID bid = l->target(nextNeighborId);
+                        cp.enqueue(bid, endPt);
+                        sent++;
+                    }
+                }
+                seedCnt++;
             }
-            seedCnt++;
+            b->endTracing();
+            pf_accum(b->timing.t_trace_enqueue, _t_enq, enable_timing);
+            if (enable_timing) b->timing.n_particles_sent += sent;
         }
-        b->endTracing();
-    } while (cp.fill_incoming());
+
+        if (enable_timing) b->timing.n_iex_rounds++;
+
+        // ── Wait for more work (network / idle time) ──────────────────────────
+        // Previously untimed: fill_incoming() blocks until new particles arrive
+        // or all neighbours confirm they are done.  This is the dominant idle
+        // signal for load-imbalance analysis.
+        double _t_fill = pf_now(enable_timing);
+        bool has_more = cp.fill_incoming();
+        pf_accum(b->timing.t_fill_incoming, _t_fill, enable_timing);
+        if (!has_more) break;
+    }
 }
 
 bool ParaFlow::trace_block_iexchange(Block*                              b,
@@ -302,9 +320,9 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         diy::Link*   link = new diy::Link;   // link is this block's neighborhood
         b->set_rank(rank);
         if (enable_timing) b->timing.mem_vmrss_before_kb = pf_read_vmrss_kb();
-        double _t_load = pf_now(enable_timing);
-        b->set_data(gid, this->meshFile.c_str(), this->vectorFiles[0].c_str(), this->seeds, this->areaIndices, this->cfg);
-        pf_accum(b->timing.t_block_load, _t_load, enable_timing);
+        // enable_timing is forwarded so set_data times t_netcdf_read and t_seed_filter
+        // internally; t_block_load is set as their sum inside set_data.
+        b->set_data(gid, this->meshFile.c_str(), this->vectorFiles[0].c_str(), this->seeds, this->areaIndices, this->cfg, this->enable_timing);
         if (enable_timing) {
             b->timing.n_seeds_initial      = (int)b->currentSeeds.size();
             b->timing.mem_vmrss_after_kb   = pf_read_vmrss_kb();
@@ -356,15 +374,25 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp) {
             b->timing.mem_peak_vmhwm_kb = pf_read_vmhwm_kb();
             fprintf(stderr,
-                "TIMING phase=block_load    rank=%d gid=%d t=%.6f nseeds=%d\n",
-                b->rank, cp.gid(), b->timing.t_block_load, b->timing.n_seeds_initial);
+                "TIMING phase=block_load    rank=%d gid=%d t=%.6f nseeds=%d"
+                " t_netcdf=%.6f t_filter=%.6f\n",
+                b->rank, cp.gid(), b->timing.t_block_load, b->timing.n_seeds_initial,
+                b->timing.t_netcdf_read, b->timing.t_seed_filter);
             fprintf(stderr,
-                "TIMING phase=trace_compute rank=%d gid=%d t=%.6f nsteps=%ld nrecv=%d\n",
+                "TIMING phase=trace_compute rank=%d gid=%d t=%.6f nsteps=%ld"
+                " nrecv=%d nsent=%d rounds=%d\n",
                 b->rank, cp.gid(), b->timing.t_trace_compute,
-                b->timing.n_steps_total, b->timing.n_particles_received);
+                b->timing.n_steps_total, b->timing.n_particles_received,
+                b->timing.n_particles_sent, b->timing.n_iex_rounds);
             fprintf(stderr,
                 "TIMING phase=trace_comm    rank=%d gid=%d t=%.6f\n",
                 b->rank, cp.gid(), b->timing.t_trace_comm);
+            fprintf(stderr,
+                "TIMING phase=trace_enqueue rank=%d gid=%d t=%.6f\n",
+                b->rank, cp.gid(), b->timing.t_trace_enqueue);
+            fprintf(stderr,
+                "TIMING phase=fill_incoming rank=%d gid=%d t=%.6f\n",
+                b->rank, cp.gid(), b->timing.t_fill_incoming);
             fprintf(stderr,
                 "TIMING phase=output_write  rank=%d gid=%d t=%.6f\n",
                 b->rank, cp.gid(), b->timing.t_output_write);
@@ -609,15 +637,25 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp) {
             b->timing.mem_peak_vmhwm_kb = pf_read_vmhwm_kb();
             fprintf(stderr,
-                "TIMING phase=block_load    rank=%d gid=%d t=%.6f nseeds=%d\n",
-                b->rank, cp.gid(), b->timing.t_block_load, b->timing.n_seeds_initial);
+                "TIMING phase=block_load    rank=%d gid=%d t=%.6f nseeds=%d"
+                " t_netcdf=%.6f t_filter=%.6f\n",
+                b->rank, cp.gid(), b->timing.t_block_load, b->timing.n_seeds_initial,
+                b->timing.t_netcdf_read, b->timing.t_seed_filter);
             fprintf(stderr,
-                "TIMING phase=trace_compute rank=%d gid=%d t=%.6f nsteps=%ld nrecv=%d\n",
+                "TIMING phase=trace_compute rank=%d gid=%d t=%.6f nsteps=%ld"
+                " nrecv=%d nsent=%d rounds=%d\n",
                 b->rank, cp.gid(), b->timing.t_trace_compute,
-                b->timing.n_steps_total, b->timing.n_particles_received);
+                b->timing.n_steps_total, b->timing.n_particles_received,
+                b->timing.n_particles_sent, b->timing.n_iex_rounds);
             fprintf(stderr,
                 "TIMING phase=trace_comm    rank=%d gid=%d t=%.6f\n",
                 b->rank, cp.gid(), b->timing.t_trace_comm);
+            fprintf(stderr,
+                "TIMING phase=trace_enqueue rank=%d gid=%d t=%.6f\n",
+                b->rank, cp.gid(), b->timing.t_trace_enqueue);
+            fprintf(stderr,
+                "TIMING phase=fill_incoming rank=%d gid=%d t=%.6f\n",
+                b->rank, cp.gid(), b->timing.t_fill_incoming);
             fprintf(stderr,
                 "TIMING phase=output_write  rank=%d gid=%d t=%.6f\n",
                 b->rank, cp.gid(), b->timing.t_output_write);

@@ -53,25 +53,35 @@ struct Block
     static void*    create()            { return new Block; }
     static void     destroy(void* b)    { delete static_cast<Block*>(b); }
 
-    void set_data(int gid, const char* meshfile, const char* datafile, std::vector<VECTOR3>& allseeds, std::vector<int>& areaIndices, TimeVaryingDataConfig &cfg) {
+    // enable_timing is forwarded from ParaFlow so that sub-phase timers
+    // (t_netcdf_read, t_seed_filter) are gated with zero overhead when disabled.
+    void set_data(int gid, const char* meshfile, const char* datafile,
+                  std::vector<VECTOR3>& allseeds, std::vector<int>& areaIndices,
+                  TimeVaryingDataConfig& cfg, bool enable_timing = false) {
         this->integrationDt = cfg.dt.value_or(1.0);
         int* areaIdxPointer = &(areaIndices[0]);
         areaIndicesArr = new int[areaIndices.size()];
-        for(int i = 0; i < areaIndices.size(); i++)
+        for(int i = 0; i < (int)areaIndices.size(); i++)
             areaIndicesArr[i] = areaIndices[i];
         this->LocalCell2GlobalCell = nullptr;
         this->GlobalCell2LocalCell = nullptr;
 
         osuflow = new OSUFlow();
+
+        // ── Phase 1: NetCDF I/O + mesh topology build ────────────────────────
+        double _t_netcdf = pf_now(enable_timing);
         if (meshfile == NULL || *meshfile == '\0') {
             std::cout << "Loading data without mesh file for gid: " << gid << std::endl;
-            osuflow->LoadMPASOData(datafile, gid, areaIndices.size(), areaIdxPointer, this->neighborIndices, 
-                                this->LocalCell2GlobalCell, this->nLocalCells, this->nVertLevels, this->GlobalCell2LocalCell, this->nGlobalCells, cfg);
+            osuflow->LoadMPASOData(datafile, gid, areaIndices.size(), areaIdxPointer, this->neighborIndices,
+                                this->LocalCell2GlobalCell, this->nLocalCells, this->nVertLevels,
+                                this->GlobalCell2LocalCell, this->nGlobalCells, cfg);
         } else {
             std::cout << "Loading data with mesh file for gid: " << gid << std::endl;
-            osuflow->LoadMPASOData(meshfile, datafile, gid, areaIndices.size(), areaIdxPointer, this->neighborIndices, 
-                                this->LocalCell2GlobalCell, this->nLocalCells, this->nVertLevels, this->GlobalCell2LocalCell, this->nGlobalCells, cfg);
+            osuflow->LoadMPASOData(meshfile, datafile, gid, areaIndices.size(), areaIdxPointer, this->neighborIndices,
+                                this->LocalCell2GlobalCell, this->nLocalCells, this->nVertLevels,
+                                this->GlobalCell2LocalCell, this->nGlobalCells, cfg);
         }
+        pf_accum(timing.t_netcdf_read, _t_netcdf, enable_timing);
 
         if (!this->neighborIndices.empty()) {
             int maxneighboridx = *std::max_element(this->neighborIndices.begin(), this->neighborIndices.end());
@@ -83,16 +93,18 @@ struct Block
         std::cerr << "[Block::set_data]: areaID2neighborID size = " << areaID2neighborID.size() << std::endl;
         assert(osuflow != nullptr && "osuflow should not be null!");
 
+        // ── Phase 2: Seed filtering — inBlock() scan over all broadcast seeds ─
         if (allseeds.empty()) {
             std::cerr << "[Block::set_data] warning: allseeds is empty, skip\n";
+            timing.t_block_load = timing.t_netcdf_read;
             return;
         }
-
 
         currentSeeds.reserve(allseeds.size());
         startPts.reserve(allseeds.size());
         fromCells.reserve(allseeds.size());
 
+        double _t_filter = pf_now(enable_timing);
         int seedCnt = 0;
         int checkpt = (allseeds.size() >= 10) ? (int)(allseeds.size() / 10) : 0;
         for (auto& seed : allseeds) {
@@ -100,30 +112,31 @@ struct Block
 
             if (osuflow->inBlock(seed)) {
                 VECTOR3 tmp;
-                for (int i = 0; i < seed.Dimension(); ++i) {
+                for (int i = 0; i < seed.Dimension(); ++i)
                     tmp[i] = seed[i];
-                }
                 currentSeeds.push_back(tmp);
 
                 PtInfo pt;
-                for (int i = 0; i < seed.Dimension(); ++i) {
+                for (int i = 0; i < seed.Dimension(); ++i)
                     pt.coord[i] = seed[i];
-                }
                 pt.pid      = seedCnt;
                 pt.gid      = gid;
                 pt.sid      = 0;
                 pt.nsteps   = 0;
                 pt.fromCell = -1;
-                pt.ts = 0.0;
+                pt.ts       = 0.0;
                 startPts.push_back(pt);
-
                 fromCells.push_back(-1);
             }
             ++seedCnt;
-            if(checkpt > 0 && seedCnt % checkpt == 0) {
-                std::cerr << "[Block::set_data] gid: " << gid << ", processed " << seedCnt << "/" << allseeds.size() << " seeds" << std::endl;
-            }
+            if(checkpt > 0 && seedCnt % checkpt == 0)
+                std::cerr << "[Block::set_data] gid: " << gid << ", processed "
+                          << seedCnt << "/" << allseeds.size() << " seeds" << std::endl;
         }
+        pf_accum(timing.t_seed_filter, _t_filter, enable_timing);
+
+        // Keep t_block_load as the sum for backwards compatibility with parse_timing.py
+        timing.t_block_load = timing.t_netcdf_read + timing.t_seed_filter;
 
         this->setStartPtsDone();
     }
