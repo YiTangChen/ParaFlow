@@ -251,7 +251,6 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 							   double dt,
 							   int* cachedLowT)
 {
-	const double speedup = 100.0;
 	int istat;
 	VECTOR4 vel;
 

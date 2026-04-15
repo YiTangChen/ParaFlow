@@ -1,7 +1,7 @@
 enable_timing: true
-outputDir: pathlines
+outputDir: pathlines/nersc_lowres
 
-maxsteps: 2000000
+maxsteps: null
 record_interval: 30
 dt: 60.0
 nproc: 256

@@ -1,24 +1,26 @@
 """
-Read and reassemble streamlines from trace_outputs/traces_<gid>.bin files.
+Read and reassemble streamline/pathline segments from <trace_dir>/<gid>.bin files.
 
 Input binary format per segment:
   [int32 pid][int32 gid][int32 sid][int32 nPts]
   [float64 x0][float64 y0][float64 z0] ...
 
-Output binary format (streamlines.bin):
-  [int32 nStreamlines]
-  For each streamline (sorted by pid):
+Output binary format (<trace_dir>/streamlines.bin or <trace_dir>/pathlines.bin):
+  [int32 nTraces]
+  For each trace (sorted by pid):
     [int32 pid][int32 nPts][float64 x0][float64 y0][float64 z0] ...
 
 Usage:
-  python read_traces.py [nblocks] [trace_dir]
-  python read_traces.py 16 trace_outputs
+  python read_traces.py [nblocks] [trace_dir] [output_bin]
+  python read_traces.py 256 streamlines/osc_lowres_gpu
+  python read_traces.py 256 pathlines/osc_lowres
 """
 
 import struct
 import sys
 import os
 from collections import defaultdict
+from pathlib import Path
 
 
 def read_trace_file(filename):
@@ -98,9 +100,27 @@ def save_as_binary(streamlines, output_path):
     print(f'Saved {len(sorted_pids)} streamlines to {output_path}')
 
 
+def infer_output_path(trace_dir, output_arg=None):
+    """Choose a stable output path for nested trace directories."""
+    trace_path = Path(trace_dir)
+    if output_arg:
+        return Path(output_arg)
+
+    lowered_parts = [part.lower() for part in trace_path.parts]
+    if any('pathline' in part for part in lowered_parts):
+        basename = 'pathlines.bin'
+    elif any('streamline' in part for part in lowered_parts):
+        basename = 'streamlines.bin'
+    else:
+        basename = f'{trace_path.name}.bin' if trace_path.name else 'traces.bin'
+
+    return trace_path / basename
+
+
 def main():
     nblocks   = int(sys.argv[1]) if len(sys.argv) > 1 else 16
     trace_dir = sys.argv[2]      if len(sys.argv) > 2 else 'streamlines'
+    output_arg = sys.argv[3]     if len(sys.argv) > 3 else None
 
     all_segments = []
     for gid in range(nblocks):
@@ -117,7 +137,7 @@ def main():
     streamlines = reassemble_streamlines(all_segments)
     print_summary(streamlines)
 
-    out_bin = os.path.join(trace_dir, trace_dir+'.bin')
+    out_bin = infer_output_path(trace_dir, output_arg)
     save_as_binary(streamlines, out_bin)
 
 

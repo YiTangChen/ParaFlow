@@ -386,7 +386,26 @@ public:
 
 	void setZTop(double* inZTop, int nTimesteps = 1);
 	void setZTopTimestamps(const std::vector<double>& timestamps);
+	const std::vector<double>& getZTopTimestamps() const { return zTopTimestamps; }
 	const double* getZTopTimestep(int timestep) const;
+
+	// Raw topology accessors — added for the CUDA backend so MPASODeviceField
+	// can pull flat pointers without MPASOGrid needing to know about GPU code.
+	// Sizes match the existing set*() inputs:
+	//   cellCoord:           [nCells]
+	//   vertexCoord:         [nLocalVertices]
+	//   verticesOnCell:      [nCells * nMaxEdges]
+	//   cellsOnCell:         [nCells * nMaxEdges]
+	//   numVerticesOnCell:   [nCells]
+	//   maxLevelCell:        [nCells]
+	//   zTop (time-varying): [nTimestepsLoaded * nLocalVertices * nVertLevels]
+	const VECTOR3* getCellCoord()          const { return cellCoord; }
+	const VECTOR3* getVertexCoord()        const { return vertexCoord; }
+	const int*     getVerticesOnCell()     const { return verticesOnCell; }
+	const int*     getCellsOnCell()        const { return cellsOnCell; }
+	const int*     getNumVerticesOnCell()  const { return numVerticesOnCell; }
+	const int*     getMaxLevelCell()       const { return maxLevelCell; }
+	const double*  getZTopAll()            const { return zTop; }
 
 	// set and get parameters
 	void setNumCell(int numOfCell) { this->nCells = numOfCell; }

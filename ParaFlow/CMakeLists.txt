@@ -1,6 +1,13 @@
 project                     (ParaFlow)
-cmake_minimum_required      (VERSION 3.13)
+cmake_minimum_required      (VERSION 3.18)
 set                         (CMAKE_CXX_STANDARD 17)
+
+# Propagated from OSUFlow: when ON, ParaFlow.cpp compiles the GPU smoke-test
+# helper and the final static lib records cudart as a link dep.
+option(OSUFLOW_ENABLE_CUDA "Build against the CUDA-enabled OSUFlow" OFF)
+if(OSUFLOW_ENABLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
 add_compile_options         (-Wno-deprecated-declarations)
 add_compile_options         (-Wno-macro-redefined)
 set                         (OSUFLOW_SRC "./OSUFlow")
@@ -24,9 +31,9 @@ if(NOT NETCDF_DIR)
 endif()
 include_directories         (${NETCDF_DIR}/include)
 ###### NERSC  
-set                         (NetCDF_LIBRARIES "${NETCDF_DIR}/lib/libnetcdf.so" "${NETCDF_CXX_DIR}/lib64/libnetcdf-c++4.so")
+# set                         (NetCDF_LIBRARIES "${NETCDF_DIR}/lib/libnetcdf.so" "${NETCDF_CXX_DIR}/lib64/libnetcdf-c++4.so")
 ###### OSC
-# set                         (NetCDF_LIBRARIES "${NETCDF_DIR}/lib/libnetcdf.so" "${NETCDF_CXX_DIR}/lib64/libnetcdf-cxx4.so")
+set                         (NetCDF_LIBRARIES "${NETCDF_DIR}/lib/libnetcdf.so" "${NETCDF_CXX_DIR}/lib64/libnetcdf-cxx4.so")
 
 # ##############################################################################  
 
@@ -59,6 +66,11 @@ target_link_libraries(ParaFlow
         ${MPI_CXX_LIBRARIES}
         ${OSUFLOW_SRC}/libOSUFlow.a
 )
+
+if(OSUFLOW_ENABLE_CUDA)
+    target_compile_definitions(ParaFlow PUBLIC OSUFLOW_ENABLE_CUDA)
+    target_link_libraries(ParaFlow PUBLIC CUDA::cudart)
+endif()
 
 
 target_compile_options(ParaFlow PRIVATE

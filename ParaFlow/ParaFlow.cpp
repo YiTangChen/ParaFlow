@@ -1,5 +1,457 @@
 #include "ParaFlow.hpp"
 
+#include <limits>
+
+#ifdef OSUFLOW_ENABLE_CUDA
+#include "GPU/CUDA/MPASOGPUTracer.h"
+#include <cstdlib>
+#include <cstdio>
+#include <cmath>
+
+// CPU/GPU parity test for the MPAS-O RK4 tracer. Enabled at runtime with:
+//   OSUFLOW_GPU_SMOKE=1 <paraflow-command>
+//
+// Reference trajectory is built by walking CPU CVectorField::at_phys() + a
+// host copy of vtCFieldLine::geodesic_step (FieldLine.C:173-195), mirroring
+// vtCFieldLine::MPASO_rk4 step-for-step. The GPU tracer is then launched with
+// the same seeds and compared position-by-position. Target (option b,
+// "acceptably close"): trajectory rel err < 1e-5 after 10 RK4 steps.
+
+static int gpu_smoke_env_int(const char* name, int fallback)
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr) return fallback;
+    int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : fallback;
+}
+
+static double gpu_smoke_env_double(const char* name, double fallback)
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr) return fallback;
+    double parsed = std::atof(value);
+    return parsed > 0.0 ? parsed : fallback;
+}
+
+static int gpu_streamline_chunk_steps()
+{
+    return gpu_smoke_env_int("OSUFLOW_GPU_STREAMLINE_CHUNK_STEPS", 43200);
+}
+
+// Host copy of FieldLine.C:geodesic_step — needed because the CPU version is
+// a protected member of vtCFieldLine. Kept numerically identical (same order,
+// same rotation matrix construction).
+static bool host_geodesic_step(VECTOR3 pt_src, double r_src,
+                               VECTOR3 h_vel,  double v_vel,
+                               double fdt,
+                               VECTOR3& pt_dst, double& r_dst)
+{
+    double vel_mag = h_vel.GetMag() * fdt;
+    if (vel_mag == 0.0) { pt_dst = pt_src; r_dst = r_src; return true; }
+    double r_new = r_src + v_vel * fdt;
+    if (r_new <= 0.0) return false;
+    double  omega    = vel_mag / r_src;
+    VECTOR3 normal   = cross(pt_src, h_vel);
+    MATRIX3 rotate_m = rotate_matrix_axis(normal, omega);
+    pt_dst = rotate_m * pt_src;
+    pt_dst.Normalize();
+    pt_dst.scale(r_new);
+    r_dst = r_new;
+    return true;
+}
+
+// Host RK4 one-step, mirroring vtCFieldLine::MPASO_rk4 (FieldLine.C:247-316).
+// Returns 0 on success, nonzero stage code on failure (1-4 = at_phys failed,
+// 5-7 = geodesic failed, 8 = bad radius).
+static int host_rk4_step(CVectorField* field,
+                         VECTOR3& pt, int& /*fromCell*/, double t, double dt)
+{
+    // Force a fresh full-scan phys_to_cell on every at_phys call by passing
+    // fromCell = -1. Trades speed for correctness — gives a ground-truth CPU
+    // trajectory that the GPU (which uses a neighbor-ring walk) must match.
+    VECTOR4 vel;
+    PointInfo ci; ci.phyCoord = pt;
+    double r0 = pt.GetMag();
+    if (r0 <= 0.0) return 8;
+
+    PointInfo ci_tmp = ci;
+    if (field->at_phys(-1, pt, ci_tmp, t, vel, nullptr) != 1) return 1;
+    VECTOR3 k1_h(vel[0], vel[1], vel[2]); double k1_v = vel[3];
+
+    VECTOR3 pt1; double r1;
+    if (!host_geodesic_step(pt, r0, k1_h, k1_v, 0.5 * dt, pt1, r1)) return 5;
+    ci_tmp = ci; ci_tmp.phyCoord = pt1;
+    if (field->at_phys(-1, pt1, ci_tmp, t, vel, nullptr) != 1) return 2;
+    VECTOR3 k2_h(vel[0], vel[1], vel[2]); double k2_v = vel[3];
+
+    VECTOR3 pt2; double r2;
+    if (!host_geodesic_step(pt, r0, k2_h, k2_v, 0.5 * dt, pt2, r2)) return 6;
+    ci_tmp = ci; ci_tmp.phyCoord = pt2;
+    if (field->at_phys(-1, pt2, ci_tmp, t, vel, nullptr) != 1) return 3;
+    VECTOR3 k3_h(vel[0], vel[1], vel[2]); double k3_v = vel[3];
+
+    VECTOR3 pt3; double r3;
+    if (!host_geodesic_step(pt, r0, k3_h, k3_v, dt, pt3, r3)) return 7;
+    ci_tmp = ci; ci_tmp.phyCoord = pt3;
+    if (field->at_phys(-1, pt3, ci_tmp, t, vel, nullptr) != 1) return 4;
+    VECTOR3 k4_h(vel[0], vel[1], vel[2]); double k4_v = vel[3];
+
+    VECTOR3 v_avg_h;
+    for (int i = 0; i < 3; ++i)
+        v_avg_h[i] = (k1_h[i] + 2.0*k2_h[i] + 2.0*k3_h[i] + k4_h[i]) / 6.0;
+    double v_avg_v = (k1_v + 2.0*k2_v + 2.0*k3_v + k4_v) / 6.0;
+
+    VECTOR3 pt_final; double r_final;
+    if (!host_geodesic_step(pt, r0, v_avg_h, v_avg_v, dt, pt_final, r_final)) return 9;
+
+    pt = pt_final;
+    return 0;
+}
+
+static void run_gpu_smoke_test(Block* b, int rank)
+{
+    if (std::getenv("OSUFLOW_GPU_SMOKE") == nullptr) return;
+    if (rank != 0) return;
+    if (b == nullptr || b->currentSeeds.empty()) {
+        std::fprintf(stderr, "[GPU parity] skipped: no seeds on rank 0 block\n");
+        return;
+    }
+
+    CVectorField* field = b->osuflow->GetFlowField();
+    MPASOGrid* grid = dynamic_cast<MPASOGrid*>(field->GetGrid());
+    Solution*  pSol = field->GetHorizontalSolution();
+    Solution*  vSol = field->GetVerticalSolution();
+    if (!grid || !pSol || !vSol) {
+        std::fprintf(stderr, "[GPU parity] skipped: grid/solution not available\n");
+        return;
+    }
+
+    const int n_particles = std::min<int>((int)b->currentSeeds.size(),
+                                          gpu_smoke_env_int("OSUFLOW_GPU_SMOKE_PARTICLES", 8));
+    const int n_steps     = gpu_smoke_env_int("OSUFLOW_GPU_SMOKE_STEPS", 10);
+    const double dt       = gpu_smoke_env_double("OSUFLOW_GPU_SMOKE_DT", 60.0);
+    const int nVertLevels = grid->getNVertLevels();
+
+    // Nudge seeds slightly below earth_radius — raw surface seeds (|r| = R)
+    // hit Grid.C's `if (|r| > earth_radius) return -1;` check as soon as RK4
+    // averaging produces any net upward vertical component.
+    const double earth_r = grid->getEarthRadius();
+    const double shrink  = (earth_r - 1.0) / earth_r;    // 1m below surface — enough to clear the |r|>R boundary check without diving below shallow bathymetry
+    std::vector<VECTOR3> seeds(n_particles);
+    std::vector<int>     seed_cells(n_particles);
+    for (int i = 0; i < n_particles; ++i) {
+        VECTOR3 s = b->currentSeeds[i];
+        s[0] *= shrink; s[1] *= shrink; s[2] *= shrink;
+        seeds[i] = s;
+        seed_cells[i] = 0;  // overwritten below once we have a CPU-locate result
+    }
+
+    // ---- CPU reference trajectory ----
+    std::vector<VECTOR3> cpu_trace(n_particles * (n_steps + 1));
+    std::vector<int>     cpu_alive(n_particles, 1);
+    std::vector<int>     cpu_steps_taken(n_particles, 0);
+    for (int p = 0; p < n_particles; ++p) {
+        VECTOR3 pt = seeds[p];
+        int fromCell = (p < (int)b->fromCells.size()) ? b->fromCells[p] : -1;
+        cpu_trace[p * (n_steps + 1)] = pt;
+
+        // One-shot probe: sample velocity at the seed so we can report it,
+        // and capture ci.inCell so we can give the GPU a valid cell hint.
+        {
+            VECTOR4 v4;
+            PointInfo ci; ci.phyCoord = pt; ci.fromCell = fromCell; ci.inCell = fromCell;
+            int ok = field->at_phys(fromCell, pt, ci, 0.0, v4, nullptr);
+            // ci.inCell is encoded as localCell * nVertLevels + vLevel
+            if (ok == 1 && ci.inCell >= 0) {
+                seed_cells[p] = ci.inCell / nVertLevels;
+                // also refresh fromCell so CPU trace uses the valid hint
+                fromCell = ci.inCell;
+            }
+            std::fprintf(stderr,
+                "[GPU parity] seed %d pos=(%.3e,%.3e,%.3e) fromCell=%d at_phys=%d v=(%.3e,%.3e,%.3e,%.3e) seed_cell=%d\n",
+                p, pt[0],pt[1],pt[2], fromCell, ok, v4[0],v4[1],v4[2],v4[3], seed_cells[p]);
+        }
+
+        double t = 0.0;
+        for (int s = 0; s < n_steps; ++s) {
+            int fail = host_rk4_step(field, pt, fromCell, t, dt);
+            if (fail != 0) {
+                std::fprintf(stderr, "[GPU parity] seed %d step %d FAILED stage=%d\n",
+                             p, s, fail);
+                cpu_alive[p] = 0;
+                for (int k = s + 1; k <= n_steps; ++k)
+                    cpu_trace[p * (n_steps + 1) + k] = pt;
+                break;
+            }
+            cpu_steps_taken[p] = s + 1;
+            // Streamline semantics: t stays at the initial timestamp (mirrors
+            // vtCFieldLine::MPASO_rk4, which only advances t under UNSTEADY).
+            cpu_trace[p * (n_steps + 1) + s + 1] = pt;
+        }
+        std::fprintf(stderr, "[GPU parity] seed %d cpu_steps_taken=%d alive=%d\n",
+                     p, cpu_steps_taken[p], cpu_alive[p]);
+    }
+
+    // ---- GPU trajectory ----
+    std::vector<VECTOR3> gpu_trace(n_particles * (n_steps + 1));
+    std::fprintf(stderr, "[GPU parity] launching: P=%d, steps=%d, dt=%.1f\n",
+                 n_particles, n_steps, dt);
+    mpaso_gpu_host::TraceParticles(grid, pSol, vSol,
+                                   seeds.data(), seed_cells.data(), n_particles,
+                                   n_steps, dt, /*t_start=*/0.0, /*use_euler=*/false,
+                                   gpu_trace.data());
+
+    // ---- compare ----
+    const double earth = earth_r;
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    int    max_p = -1, max_s = -1;
+    int    compared_count = 0;
+    double first_seed_mag = seeds[0].GetMag();
+    for (int p = 0; p < n_particles; ++p) {
+        if (!cpu_alive[p]) continue;
+        for (int s = 1; s <= n_steps; ++s) {
+            const VECTOR3& a = cpu_trace[p * (n_steps + 1) + s];
+            const VECTOR3& g = gpu_trace[p * (n_steps + 1) + s];
+            double dx = a[0]-g[0], dy = a[1]-g[1], dz = a[2]-g[2];
+            double d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+            double mag = std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+            double rel = (mag > 0.0) ? d / mag : d;
+            ++compared_count;
+            if (d > max_abs)   { max_abs = d; max_p = p; max_s = s; }
+            if (rel > max_rel) { max_rel = rel; }
+        }
+    }
+
+    const double rel_thresh = gpu_smoke_env_double("OSUFLOW_GPU_SMOKE_REL_THRESH", 1e-5);
+    std::fprintf(stderr, "[GPU parity] compared=%d max_abs=%.3e m  max_rel=%.3e  (earth=%.3e, seed0|r|=%.3e)\n",
+                 compared_count, max_abs, max_rel, earth, first_seed_mag);
+    if (compared_count <= 0) {
+        std::fprintf(stderr, "[GPU parity] FAIL: no comparable CPU/GPU samples\n");
+    } else if (max_rel < rel_thresh) {
+        std::fprintf(stderr, "[GPU parity] PASS (rel err < %.1e)\n", rel_thresh);
+    } else {
+        std::fprintf(stderr, "[GPU parity] FAIL at p=%d step=%d\n", max_p, max_s);
+        if (max_p >= 0) {
+            const VECTOR3& a = cpu_trace[max_p * (n_steps + 1) + max_s];
+            const VECTOR3& g = gpu_trace[max_p * (n_steps + 1) + max_s];
+            std::fprintf(stderr, "  cpu=(%.9e,%.9e,%.9e)\n", a[0],a[1],a[2]);
+            std::fprintf(stderr, "  gpu=(%.9e,%.9e,%.9e)\n", g[0],g[1],g[2]);
+        }
+    }
+}
+
+// Host RK4 one-step for pathlines — like host_rk4_step but advances sample
+// time per stage, mirroring vtCFieldLine::MPASO_rk4 UNSTEADY branch:
+//   stage1 at t, stages 2/3 at t+dt/2, stage 4 at t+dt.
+static int host_rk4_step_pathline(CVectorField* field,
+                                  VECTOR3& pt, double t, double dt)
+{
+    VECTOR4 vel;
+    PointInfo ci; ci.phyCoord = pt;
+    double r0 = pt.GetMag();
+    if (r0 <= 0.0) return 8;
+
+    PointInfo ci_tmp = ci;
+    if (field->at_phys(-1, pt, ci_tmp, t, vel, nullptr) != 1) return 1;
+    VECTOR3 k1_h(vel[0], vel[1], vel[2]); double k1_v = vel[3];
+
+    VECTOR3 pt1; double r1;
+    if (!host_geodesic_step(pt, r0, k1_h, k1_v, 0.5 * dt, pt1, r1)) return 5;
+    ci_tmp = ci; ci_tmp.phyCoord = pt1;
+    if (field->at_phys(-1, pt1, ci_tmp, t + 0.5 * dt, vel, nullptr) != 1) return 2;
+    VECTOR3 k2_h(vel[0], vel[1], vel[2]); double k2_v = vel[3];
+
+    VECTOR3 pt2; double r2;
+    if (!host_geodesic_step(pt, r0, k2_h, k2_v, 0.5 * dt, pt2, r2)) return 6;
+    ci_tmp = ci; ci_tmp.phyCoord = pt2;
+    if (field->at_phys(-1, pt2, ci_tmp, t + 0.5 * dt, vel, nullptr) != 1) return 3;
+    VECTOR3 k3_h(vel[0], vel[1], vel[2]); double k3_v = vel[3];
+
+    VECTOR3 pt3; double r3;
+    if (!host_geodesic_step(pt, r0, k3_h, k3_v, dt, pt3, r3)) return 7;
+    ci_tmp = ci; ci_tmp.phyCoord = pt3;
+    if (field->at_phys(-1, pt3, ci_tmp, t + dt, vel, nullptr) != 1) return 4;
+    VECTOR3 k4_h(vel[0], vel[1], vel[2]); double k4_v = vel[3];
+
+    VECTOR3 v_avg_h;
+    for (int i = 0; i < 3; ++i)
+        v_avg_h[i] = (k1_h[i] + 2.0*k2_h[i] + 2.0*k3_h[i] + k4_h[i]) / 6.0;
+    double v_avg_v = (k1_v + 2.0*k2_v + 2.0*k3_v + k4_v) / 6.0;
+
+    VECTOR3 pt_final; double r_final;
+    if (!host_geodesic_step(pt, r0, v_avg_h, v_avg_v, dt, pt_final, r_final)) return 9;
+
+    pt = pt_final;
+    return 0;
+}
+
+static void run_gpu_pathline_parity_test(Block* b, int rank)
+{
+    if (std::getenv("OSUFLOW_GPU_SMOKE") == nullptr) return;
+    if (rank != 0) return;
+    if (b == nullptr || b->currentSeeds.empty()) {
+        std::fprintf(stderr, "[GPU pathline parity] skipped: no seeds on rank 0 block\n");
+        return;
+    }
+
+    CVectorField* field = b->osuflow->GetFlowField();
+    MPASOGrid* grid = dynamic_cast<MPASOGrid*>(field->GetGrid());
+    Solution*  pSol = field->GetHorizontalSolution();
+    Solution*  vSol = field->GetVerticalSolution();
+    if (!grid || !pSol || !vSol) {
+        std::fprintf(stderr, "[GPU pathline parity] skipped: grid/solution not available\n");
+        return;
+    }
+
+    const int n_particles = std::min<int>((int)b->currentSeeds.size(),
+                                          gpu_smoke_env_int("OSUFLOW_GPU_SMOKE_PARTICLES", 8));
+    const int n_steps     = gpu_smoke_env_int("OSUFLOW_GPU_SMOKE_STEPS", 10);
+    const double dt       = gpu_smoke_env_double("OSUFLOW_GPU_SMOKE_DT", 60.0);
+    const int nVertLevels = grid->getNVertLevels();
+
+    // Pick t_start from the loaded window — use timestamps[0] so at_phys has
+    // both endpoints of the first interval available.
+    const std::vector<double>& tsWin = grid->getZTopTimestamps();
+    double t_start = tsWin.empty() ? 0.0 : tsWin[0];
+
+    const double earth_r = grid->getEarthRadius();
+    const double shrink  = (earth_r - 1.0) / earth_r;
+    std::vector<VECTOR3> seeds(n_particles);
+    std::vector<int>     seed_cells(n_particles);
+    std::vector<double>  seed_t_start(n_particles, t_start);
+    for (int i = 0; i < n_particles; ++i) {
+        VECTOR3 s = b->currentSeeds[i];
+        s[0] *= shrink; s[1] *= shrink; s[2] *= shrink;
+        seeds[i] = s;
+        seed_cells[i] = 0;
+    }
+
+    // ---- CPU reference trajectory (time-varying) ----
+    std::vector<VECTOR3> cpu_trace(n_particles * (n_steps + 1));
+    std::vector<int>     cpu_alive(n_particles, 1);
+    std::vector<int>     cpu_steps_taken(n_particles, 0);
+    for (int p = 0; p < n_particles; ++p) {
+        VECTOR3 pt = seeds[p];
+        int fromCell = (p < (int)b->fromCells.size()) ? b->fromCells[p] : -1;
+        cpu_trace[p * (n_steps + 1)] = pt;
+
+        {
+            VECTOR4 v4;
+            PointInfo ci; ci.phyCoord = pt; ci.fromCell = fromCell; ci.inCell = fromCell;
+            int ok = field->at_phys(fromCell, pt, ci, t_start, v4, nullptr);
+            if (ok == 1 && ci.inCell >= 0) {
+                seed_cells[p] = ci.inCell / nVertLevels;
+            }
+            std::fprintf(stderr,
+                "[GPU pathline parity] seed %d pos=(%.3e,%.3e,%.3e) at_phys=%d v=(%.3e,%.3e,%.3e,%.3e) seed_cell=%d t_start=%.3e\n",
+                p, pt[0],pt[1],pt[2], ok, v4[0],v4[1],v4[2],v4[3], seed_cells[p], t_start);
+        }
+
+        double t = t_start;
+        for (int s = 0; s < n_steps; ++s) {
+            int fail = host_rk4_step_pathline(field, pt, t, dt);
+            if (fail != 0) {
+                std::fprintf(stderr, "[GPU pathline parity] seed %d step %d FAILED stage=%d\n",
+                             p, s, fail);
+                cpu_alive[p] = 0;
+                for (int k = s + 1; k <= n_steps; ++k)
+                    cpu_trace[p * (n_steps + 1) + k] = pt;
+                break;
+            }
+            t += dt;
+            cpu_steps_taken[p] = s + 1;
+            cpu_trace[p * (n_steps + 1) + s + 1] = pt;
+        }
+        std::fprintf(stderr, "[GPU pathline parity] seed %d cpu_steps_taken=%d alive=%d final_t=%.3e\n",
+                     p, cpu_steps_taken[p], cpu_alive[p], t_start + cpu_steps_taken[p] * dt);
+    }
+
+    // ---- GPU trajectory ----
+    std::vector<VECTOR3> gpu_trace(n_particles * (n_steps + 1));
+    std::vector<double>  gpu_final_time(n_particles, 0.0);
+    std::vector<int>     gpu_steps_taken(n_particles, 0);
+    std::vector<int>     gpu_final_cell(n_particles, -1);
+    std::vector<int>     gpu_seed_max_steps(n_particles, n_steps);
+    std::fprintf(stderr, "[GPU pathline parity] launching: P=%d, steps=%d, dt=%.1f, t_start=%.3e\n",
+                 n_particles, n_steps, dt, t_start);
+    mpaso_gpu_host::TracePathlineBatch(grid, pSol, vSol,
+                                       seeds.data(), seed_cells.data(), seed_t_start.data(),
+                                       gpu_seed_max_steps.data(),
+                                       n_particles, n_steps, dt,
+                                       gpu_trace.data(),
+                                       gpu_final_time.data(),
+                                       gpu_steps_taken.data(),
+                                       gpu_final_cell.data());
+
+    // ---- compare ----
+    double max_abs = 0.0, max_rel = 0.0;
+    int    max_p = -1, max_s = -1;
+    int    compared_count = 0;
+    bool   step_mismatch = false;
+    for (int p = 0; p < n_particles; ++p) {
+        if (!cpu_alive[p]) continue;
+        int steps_cmp = std::min(cpu_steps_taken[p], gpu_steps_taken[p]);
+        std::fprintf(stderr, "[GPU pathline parity] seed %d cpu_steps=%d gpu_steps=%d gpu_final_t=%.3e\n",
+                     p, cpu_steps_taken[p], gpu_steps_taken[p], gpu_final_time[p]);
+        if (gpu_steps_taken[p] != cpu_steps_taken[p]) step_mismatch = true;
+        for (int s = 1; s <= steps_cmp; ++s) {
+            const VECTOR3& a = cpu_trace[p * (n_steps + 1) + s];
+            const VECTOR3& g = gpu_trace[p * (n_steps + 1) + s];
+            double dx = a[0]-g[0], dy = a[1]-g[1], dz = a[2]-g[2];
+            double d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+            double mag = std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+            double rel = (mag > 0.0) ? d / mag : d;
+            ++compared_count;
+            if (d > max_abs)   { max_abs = d; max_p = p; max_s = s; }
+            if (rel > max_rel) { max_rel = rel; }
+        }
+    }
+
+    const double rel_thresh = gpu_smoke_env_double("OSUFLOW_GPU_SMOKE_REL_THRESH", 1e-5);
+    std::fprintf(stderr, "[GPU pathline parity] compared=%d max_abs=%.3e m  max_rel=%.3e\n",
+                 compared_count, max_abs, max_rel);
+    if (compared_count <= 0) {
+        std::fprintf(stderr, "[GPU pathline parity] FAIL: no comparable CPU/GPU samples\n");
+    } else if (step_mismatch) {
+        std::fprintf(stderr, "[GPU pathline parity] FAIL: CPU/GPU step counts differ\n");
+    } else if (max_rel < rel_thresh) {
+        std::fprintf(stderr, "[GPU pathline parity] PASS (rel err < %.1e)\n", rel_thresh);
+    } else {
+        std::fprintf(stderr, "[GPU pathline parity] FAIL at p=%d step=%d\n", max_p, max_s);
+        if (max_p >= 0) {
+            const VECTOR3& a = cpu_trace[max_p * (n_steps + 1) + max_s];
+            const VECTOR3& g = gpu_trace[max_p * (n_steps + 1) + max_s];
+            std::fprintf(stderr, "  cpu=(%.9e,%.9e,%.9e)\n", a[0],a[1],a[2]);
+            std::fprintf(stderr, "  gpu=(%.9e,%.9e,%.9e)\n", g[0],g[1],g[2]);
+        }
+    }
+}
+#endif // OSUFLOW_ENABLE_CUDA
+
+namespace {
+constexpr int PF_UNLIMITED_STEPS = -1;
+constexpr int PF_STEP_LIMIT_SENTINEL = std::numeric_limits<int>::max() / 4;
+
+inline bool pf_unlimited_steps(int max_steps)
+{
+    return max_steps == PF_UNLIMITED_STEPS;
+}
+
+inline int pf_remaining_steps(int max_steps, int nsteps_done)
+{
+    return pf_unlimited_steps(max_steps)
+        ? PF_STEP_LIMIT_SENTINEL
+        : std::max(0, max_steps - nsteps_done);
+}
+
+inline bool pf_finished_by_steps(int max_steps, int nsteps_done)
+{
+    return !pf_unlimited_steps(max_steps) && nsteps_done >= max_steps;
+}
+} // namespace
+
+
 void ParaFlow::ReadRegularGridXYZ(const char* regularField, int &domain_x, int &domain_y, int &domain_z) 
 {
     std::ifstream myFile;
@@ -76,6 +528,29 @@ ParaFlow::ParaFlow(int argc, char* argv[], const char* configFile)
     // Read timing flag first so it applies to seed I/O below
     this->enable_timing = config["enable_timing"] ? config["enable_timing"].as<bool>() : false;
 
+    // GPU execution flag. Resolve against runtime availability below once we
+    // know whether the binary was built with CUDA and a device is present.
+    bool requested_gpu = config["useGPU"] ? config["useGPU"].as<bool>() : false;
+#ifdef OSUFLOW_ENABLE_CUDA
+    if (requested_gpu) {
+        if (mpaso_gpu_host::isAvailable()) {
+            this->useGPU = true;
+            if (world.rank() == 0)
+                std::fprintf(stderr, "[ParaFlow] useGPU=true — CUDA device available, using GPU tracer\n");
+        } else {
+            this->useGPU = false;
+            if (world.rank() == 0)
+                std::fprintf(stderr, "[ParaFlow] useGPU=true but no CUDA device visible — falling back to CPU tracer\n");
+        }
+    } else {
+        this->useGPU = false;
+    }
+#else
+    if (requested_gpu && world.rank() == 0)
+        std::fprintf(stderr, "[ParaFlow] useGPU=true but binary built without CUDA — falling back to CPU tracer\n");
+    this->useGPU = false;
+#endif
+
     try {
         if(config["nproc"])
             this->size = config["nproc"].as<int>();
@@ -85,8 +560,12 @@ ParaFlow::ParaFlow(int argc, char* argv[], const char* configFile)
             this->nblocks = config["nblocks"].as<int>();
         else
             throw "The number of nblocks isn't specified correctly.\n";
-        if(config["maxsteps"])
+        bool requested_time_varying =
+            config["isTimeVarying"] ? config["isTimeVarying"].as<bool>() : false;
+        if(config["maxsteps"] && !config["maxsteps"].IsNull())
             this->max_steps = config["maxsteps"].as<int>();
+        else if (requested_time_varying)
+            this->max_steps = PF_UNLIMITED_STEPS;
         else
             throw "The number of steps isn't specified correctly.\n";
         this->interval = config["record_interval"] ? config["record_interval"].as<int>() : 1;
@@ -210,7 +689,7 @@ void ParaFlow::trace_block(Block*                               b,
         // std::cerr << "[rank " << b->rank << ", gid " << cp.gid() << "] Tracing " << b->currentSeeds.size() << " seeds\n";
         int maxRemaining = 0;
         for (auto& pt : b->startPts)
-            maxRemaining = std::max(maxRemaining, this->max_steps - pt.nsteps);
+            maxRemaining = std::max(maxRemaining, pf_remaining_steps(this->max_steps, pt.nsteps));
 
         double _t_comp = pf_now(enable_timing);
         b->GenStreamLineByOSUFlow(maxRemaining, this->interval);
@@ -240,7 +719,7 @@ void ParaFlow::trace_block(Block*                               b,
             if (seedCnt < (int)b->sl_stepcounts.size())
                 currseg.nsteps += b->sl_stepcounts[seedCnt];
 
-            if(currseg.nsteps >= this->max_steps)
+            if(pf_finished_by_steps(this->max_steps, currseg.nsteps))
                 finished = true;
 
             // skip seeds that were out of boundary from the start
@@ -275,10 +754,223 @@ void ParaFlow::trace_block(Block*                               b,
     } while (cp.fill_incoming());
 }
 
-bool ParaFlow::trace_block_iexchange(Block*                              b,
-                                    const diy::Master::ProxyWithLink&    cp)
+#ifdef OSUFLOW_ENABLE_CUDA
+void ParaFlow::trace_block_gpu(Block*                             b,
+                               const diy::Master::ProxyWithLink&  cp)
 {
+    diy::Link* l = cp.link();
+    const int chunkSteps = gpu_streamline_chunk_steps();
+
+    do
+    {
+        double _t_comm = pf_now(enable_timing);
+        this->deq_incoming_iexchange(b, cp);
+        pf_accum(b->timing.t_trace_comm, _t_comm, enable_timing);
+
+        if (b->currentSeeds.empty())
+            continue;
+
+        CVectorField* field = b->osuflow->GetFlowField();
+        MPASOGrid* grid = dynamic_cast<MPASOGrid*>(field->GetGrid());
+        Solution*  pSol = field->GetHorizontalSolution();
+        Solution*  vSol = field->GetVerticalSolution();
+        if (!grid || !pSol || !vSol) {
+            std::fprintf(stderr,
+                "[ParaFlow] GPU streamline skipped for gid=%d: grid/solution unavailable, using CPU\n",
+                cp.gid());
+            this->trace_block(b, cp);
+            return;
+        }
+
+        const int n_particles = (int)b->currentSeeds.size();
+        std::vector<int> remaining_steps(n_particles, 0);
+        for (int i = 0; i < n_particles && i < (int)b->startPts.size(); i++) {
+            int remaining = pf_remaining_steps(this->max_steps, b->startPts[i].nsteps);
+            remaining_steps[i] = remaining;
+        }
+
+        std::vector<int> current_cells(n_particles, -1);
+        for (int i = 0; i < n_particles; i++) {
+            int fromCell = (i < (int)b->fromCells.size()) ? b->fromCells[i] : -1;
+            VECTOR4 v4;
+            PointInfo ci;
+            ci.phyCoord = b->currentSeeds[i];
+            ci.fromCell = fromCell;
+            ci.inCell = fromCell;
+            int ok = field->at_phys(fromCell, b->currentSeeds[i], ci, 0.0, v4, nullptr);
+            if (ok == 1 && ci.inCell >= 0)
+                current_cells[i] = ci.inCell / b->nVertLevels;
+        }
+
+        std::vector<VECTOR3> current_pos = b->currentSeeds;
+        std::vector<Segment> segments(n_particles);
+        std::vector<int> total_steps_taken(n_particles, 0);
+        std::vector<unsigned char> active(n_particles, 0);
+        b->toCells.assign(n_particles, -1);
+
+        int active_count = 0;
+        for (int i = 0; i < n_particles && i < (int)b->startPts.size(); i++) {
+            Segment& seg = segments[i];
+            seg.gid    = b->startPts[i].gid;
+            seg.pid    = b->startPts[i].pid;
+            seg.sid    = b->startPts[i].sid;
+            seg.nsteps = b->startPts[i].nsteps;
+            if (remaining_steps[i] > 0) {
+                active[i] = 1;
+                active_count++;
+            }
+        }
+
+        double _t_comp = pf_now(enable_timing);
+        while (active_count > 0)
+        {
+            std::vector<int> active_indices;
+            active_indices.reserve(active_count);
+            int launchSteps = 0;
+            for (int i = 0; i < n_particles; i++) {
+                if (!active[i]) continue;
+                int perSeedSteps = std::min(remaining_steps[i], chunkSteps);
+                if (perSeedSteps <= 0) continue;
+                active_indices.push_back(i);
+                launchSteps = std::max(launchSteps, perSeedSteps);
+            }
+            if (active_indices.empty() || launchSteps <= 0)
+                break;
+
+            const int n_launch = (int)active_indices.size();
+            std::vector<VECTOR3> launch_seeds(n_launch);
+            std::vector<int> launch_cells(n_launch, -1);
+            std::vector<int> launch_max_steps(n_launch, 0);
+            std::vector<int> launch_step_offsets(n_launch, 0);
+            for (int j = 0; j < n_launch; j++) {
+                int seedCnt = active_indices[j];
+                launch_seeds[j] = current_pos[seedCnt];
+                launch_cells[j] = current_cells[seedCnt];
+                launch_max_steps[j] = std::min(remaining_steps[seedCnt], launchSteps);
+                launch_step_offsets[j] = segments[seedCnt].nsteps;
+            }
+
+            const int saveInterval = std::max(1, this->interval);
+            const int maxSaved = (launchSteps + saveInterval - 1) / saveInterval + 2;
+            std::vector<VECTOR3> gpu_trace((size_t)n_launch * maxSaved);
+            std::vector<int> gpu_steps_taken(n_launch, 0);
+            std::vector<int> gpu_final_cell(n_launch, -1);
+            std::vector<int> gpu_saved_counts(n_launch, 0);
+
+            mpaso_gpu_host::TraceParticles(grid, pSol, vSol,
+                                           launch_seeds.data(),
+                                           launch_cells.data(),
+                                           n_launch,
+                                           launchSteps,
+                                           b->integrationDt,
+                                           /*t_start=*/0.0,
+                                           /*use_euler=*/false,
+                                           gpu_trace.data(),
+                                           launch_max_steps.data(),
+                                           launch_step_offsets.data(),
+                                           gpu_steps_taken.data(),
+                                           gpu_final_cell.data(),
+                                           saveInterval,
+                                           maxSaved,
+                                           gpu_saved_counts.data());
+
+            for (int j = 0; j < n_launch; j++)
+            {
+                int seedCnt = active_indices[j];
+                Segment& seg = segments[seedCnt];
+                int steps = gpu_steps_taken[j];
+                int savedCount = gpu_saved_counts[j];
+                int row = j * maxSaved;
+
+                VECTOR3 lastPos = (savedCount > 0)
+                    ? gpu_trace[row + savedCount - 1]
+                    : current_pos[seedCnt];
+                int oldStep = seg.nsteps;
+                int toCell = (gpu_final_cell[j] >= 0)
+                    ? gpu_final_cell[j] * b->nVertLevels
+                    : -1;
+                b->toCells[seedCnt] = toCell;
+                current_pos[seedCnt] = lastPos;
+                current_cells[seedCnt] = gpu_final_cell[j];
+                seg.nsteps += steps;
+                total_steps_taken[seedCnt] += steps;
+                remaining_steps[seedCnt] = std::max(0, remaining_steps[seedCnt] - steps);
+
+                bool finished = pf_finished_by_steps(this->max_steps, seg.nsteps);
+                bool stoppedEarly = steps < launch_max_steps[j] || toCell < 0;
+                int nextNeighborId = b->GetNeighborId(toCell);
+                bool handoff = !finished && nextNeighborId >= 0;
+                bool dead = !finished && stoppedEarly && nextNeighborId < 0;
+                bool terminal = finished || handoff || dead;
+
+                int appendCount = savedCount;
+                bool forcedChunkFinal = steps > 0 &&
+                    ((oldStep + steps) % saveInterval) != 0;
+                if (!terminal && forcedChunkFinal && appendCount > 1)
+                    appendCount--;
+
+                if (appendCount > 0) {
+                    if (seg.coords.empty())
+                        seg.coords.push_back(gpu_trace[row]);
+                    for (int k = 1; k < appendCount; k++)
+                        seg.coords.push_back(gpu_trace[row + k]);
+                }
+
+                if (terminal)
+                {
+                    bool firstStepFailed = (total_steps_taken[seedCnt] == 0 && toCell < 0);
+                    if (!firstStepFailed) {
+                        bool duplicateLast =
+                            !seg.coords.empty() &&
+                            seg.coords.back()[0] == lastPos[0] &&
+                            seg.coords.back()[1] == lastPos[1] &&
+                            seg.coords.back()[2] == lastPos[2];
+                        if (!duplicateLast)
+                            seg.coords.push_back(lastPos);
+                        b->segs.push_back(seg);
+                    }
+
+                    if (handoff)
+                    {
+                        PtInfo endPt;
+                        for (int i = 0; i < 3; i++)
+                            endPt.coord[i] = lastPos[i];
+                        endPt.gid      = seg.gid;
+                        endPt.pid      = seg.pid;
+                        endPt.sid      = seg.sid + 1;
+                        endPt.nsteps   = seg.nsteps;
+                        endPt.fromCell = b->GetGlobalCellidx(toCell);
+
+                        diy::BlockID bid = l->target(nextNeighborId);
+                        cp.enqueue(bid, endPt);
+                    }
+
+                    active[seedCnt] = 0;
+                    active_count--;
+                }
+            }
+        }
+        pf_accum(b->timing.t_trace_compute, _t_comp, enable_timing);
+
+        b->sl_stepcounts = total_steps_taken;
+        if (enable_timing)
+            for (auto s : total_steps_taken) b->timing.n_steps_total += s;
+        b->endTracing();
+    } while (cp.fill_incoming());
+}
+#endif
+
+bool ParaFlow::trace_block_iexchange(Block*                              b,
+	                                    const diy::Master::ProxyWithLink&    cp)
+{
+#ifdef OSUFLOW_ENABLE_CUDA
+    if (this->useGPU)
+        this->trace_block_gpu(b, cp);
+    else
+        this->trace_block(b, cp);
+#else
     this->trace_block(b, cp);
+#endif
     return true;
 }
 
@@ -326,6 +1018,10 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
             link->add_neighbor(neighbor);
         }
         master.add(gid, b, link); // add block to the master (mandatory)
+
+#ifdef OSUFLOW_ENABLE_CUDA
+        run_gpu_smoke_test(b, rank);
+#endif
     }
 
     double t_iexchange = 0.0;
@@ -422,7 +1118,7 @@ void ParaFlow::trace_block_pathline(Block*                              b,
         // ── Advect particles through the time-varying field ──────────────────
         int maxRemaining = 0;
         for (auto& pt : b->startPts)
-            maxRemaining = std::max(maxRemaining, this->max_steps - pt.nsteps);
+            maxRemaining = std::max(maxRemaining, pf_remaining_steps(this->max_steps, pt.nsteps));
 
         double _t_comp = pf_now(enable_timing);
         b->GenPathLineByOSUFlow(maxRemaining, tarray.data(), this->interval);
@@ -460,7 +1156,7 @@ void ParaFlow::trace_block_pathline(Block*                              b,
             if (currseg.coords.empty())
                 continue;
 
-            bool finished = (currseg.nsteps >= this->max_steps);
+            bool finished = pf_finished_by_steps(this->max_steps, currseg.nsteps);
 
             int toCell         = (seedCnt < (int)b->toCells.size()) ? b->toCells[seedCnt] : -1;
             int nextNeighborId = b->GetNeighborId(toCell);
@@ -498,6 +1194,163 @@ void ParaFlow::trace_block_pathline(Block*                              b,
         b->endTracing();
     } while (cp.fill_incoming());
 }
+
+#ifdef OSUFLOW_ENABLE_CUDA
+void ParaFlow::trace_block_pathline_gpu(Block*                              b,
+                                        const diy::Master::ProxyWithLink&   cp)
+{
+    diy::Link* l = cp.link();
+
+    do
+    {
+        double _t_comm = pf_now(enable_timing);
+        this->deq_incoming_iexchange(b, cp);
+        pf_accum(b->timing.t_trace_comm, _t_comm, enable_timing);
+
+        if (b->currentSeeds.empty())
+            continue;
+
+        CVectorField* field = b->osuflow->GetFlowField();
+        MPASOGrid* grid = dynamic_cast<MPASOGrid*>(field->GetGrid());
+        Solution*  pSol = field->GetHorizontalSolution();
+        Solution*  vSol = field->GetVerticalSolution();
+        if (!grid || !pSol || !vSol) {
+            std::fprintf(stderr,
+                "[ParaFlow] GPU pathline skipped for gid=%d: grid/solution unavailable, using CPU\n",
+                cp.gid());
+            this->trace_block_pathline(b, cp);
+            return;
+        }
+
+        const int n_particles = (int)b->currentSeeds.size();
+        std::vector<double> tarray(n_particles, 0.0);
+        std::vector<int> seed_max_steps(n_particles, 0);
+        for (int i = 0; i < n_particles && i < (int)b->startPts.size(); i++)
+            tarray[i] = b->startPts[i].ts;
+
+        int maxRemaining = 0;
+        int maxWindowSteps = 0;
+        const double dt = b->integrationDt;
+        const double maxT = b->getWindowMaxTime();
+        for (int i = 0; i < n_particles && i < (int)b->startPts.size(); i++) {
+            int remaining = pf_remaining_steps(this->max_steps, b->startPts[i].nsteps);
+            seed_max_steps[i] = remaining;
+            maxRemaining = std::max(maxRemaining, remaining);
+            double windowRemaining = maxT - tarray[i];
+            int windowSteps = (windowRemaining > 0.0 && dt > 0.0)
+                ? (int)std::floor((windowRemaining + 1.0e-9) / dt)
+                : 0;
+            maxWindowSteps = std::max(maxWindowSteps, std::min(remaining, windowSteps));
+        }
+
+        int n_steps = std::min(maxRemaining, maxWindowSteps);
+        if (n_steps <= 0) {
+            for (int i = 0; i < n_particles && i < (int)b->startPts.size(); i++) {
+                if (pf_finished_by_steps(this->max_steps, b->startPts[i].nsteps))
+                    continue;
+                b->temporalBoundaryPts.push_back(b->startPts[i]);
+            }
+            b->endTracing();
+            continue;
+        }
+
+        std::vector<int> seed_cells(n_particles, -1);
+        for (int i = 0; i < n_particles; i++) {
+            int fromCell = (i < (int)b->fromCells.size()) ? b->fromCells[i] : -1;
+            VECTOR4 v4;
+            PointInfo ci;
+            ci.phyCoord = b->currentSeeds[i];
+            ci.fromCell = fromCell;
+            ci.inCell = fromCell;
+            int ok = field->at_phys(fromCell, b->currentSeeds[i], ci, tarray[i], v4, nullptr);
+            if (ok == 1 && ci.inCell >= 0)
+                seed_cells[i] = ci.inCell / b->nVertLevels;
+        }
+
+        std::vector<VECTOR3> gpu_trace((size_t)n_particles * (n_steps + 1));
+        std::vector<double>  gpu_final_time(n_particles, 0.0);
+        std::vector<int>     gpu_steps_taken(n_particles, 0);
+        std::vector<int>     gpu_final_cell(n_particles, -1);
+
+        double _t_comp = pf_now(enable_timing);
+        mpaso_gpu_host::TracePathlineBatch(grid, pSol, vSol,
+                                           b->currentSeeds.data(),
+                                           seed_cells.data(),
+                                           tarray.data(),
+                                           seed_max_steps.data(),
+                                           n_particles,
+                                           n_steps,
+                                           dt,
+                                           gpu_trace.data(),
+                                           gpu_final_time.data(),
+                                           gpu_steps_taken.data(),
+                                           gpu_final_cell.data());
+        pf_accum(b->timing.t_trace_compute, _t_comp, enable_timing);
+
+        b->pl_stepcounts = gpu_steps_taken;
+        b->toCells.assign(n_particles, -1);
+        if (enable_timing)
+            for (auto s : gpu_steps_taken) b->timing.n_steps_total += s;
+
+        for (int seedCnt = 0; seedCnt < n_particles; seedCnt++)
+        {
+            Segment currseg;
+            currseg.gid    = b->startPts[seedCnt].gid;
+            currseg.pid    = b->startPts[seedCnt].pid;
+            currseg.sid    = b->startPts[seedCnt].sid;
+            currseg.nsteps = b->startPts[seedCnt].nsteps + gpu_steps_taken[seedCnt];
+
+            int steps = gpu_steps_taken[seedCnt];
+            int row = seedCnt * (n_steps + 1);
+            for (int s = 0; s <= steps; s++) {
+                if (s == 0 || s == steps || (s % this->interval) == 0)
+                    currseg.coords.push_back(gpu_trace[row + s]);
+            }
+
+            if (currseg.coords.empty())
+                continue;
+
+            int toCell = (gpu_final_cell[seedCnt] >= 0)
+                ? gpu_final_cell[seedCnt] * b->nVertLevels
+                : -1;
+            b->toCells[seedCnt] = toCell;
+
+            bool finished = pf_finished_by_steps(this->max_steps, currseg.nsteps);
+            int nextNeighborId = b->GetNeighborId(toCell);
+            double exitTime = gpu_final_time[seedCnt];
+            bool isTemporal = (!finished && nextNeighborId < 0 && exitTime >= maxT - b->integrationDt);
+
+            b->segs.push_back(currseg);
+
+            if (!finished)
+            {
+                PtInfo endPt;
+                for (int i = 0; i < 3; i++)
+                    endPt.coord[i] = currseg.coords.back()[i];
+                endPt.gid      = currseg.gid;
+                endPt.pid      = currseg.pid;
+                endPt.sid      = currseg.sid + 1;
+                endPt.nsteps   = currseg.nsteps;
+                endPt.ts       = exitTime;
+
+                if (isTemporal)
+                {
+                    endPt.fromCell = (toCell >= 0) ? b->GetGlobalCellidx(toCell) : -1;
+                    b->temporalBoundaryPts.push_back(endPt);
+                }
+                else if (nextNeighborId >= 0)
+                {
+                    endPt.fromCell = b->GetGlobalCellidx(toCell);
+                    diy::BlockID bid = l->target(nextNeighborId);
+                    cp.enqueue(bid, endPt);
+                }
+            }
+        }
+
+        b->endTracing();
+    } while (cp.fill_incoming());
+}
+#endif
 
 bool ParaFlow::trace_block_pathline_iexchange(Block*                              b,
                                                const diy::Master::ProxyWithLink&   cp)
@@ -547,6 +1400,10 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
             link->add_neighbor(neighbor);
         }
         master.add(gid, b, link);
+
+#ifdef OSUFLOW_ENABLE_CUDA
+        run_gpu_pathline_parity_test(b, rank);
+#endif
     }
 
     // Get total timesteps in file from first local block (all blocks share the same file)
@@ -560,6 +1417,12 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
     while (true) {
         double _t_iex = pf_now(enable_timing);
         master.iexchange([&](Block* b, const diy::Master::ProxyWithLink& icp) -> bool {
+#ifdef OSUFLOW_ENABLE_CUDA
+            if (this->useGPU) {
+                this->trace_block_pathline_gpu(b, icp);
+                return true;
+            }
+#endif
             return this->trace_block_pathline_iexchange(b, icp);
         });
         world.barrier();
@@ -570,6 +1433,16 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
             fprintf(stderr, "TIMING phase=window_iexchange rank=%d window=%d t=%.6f\n",
                     rank, windowIdx, t_window);
         windowIdx++;
+
+        int local_active = 0;
+        master.foreach([&](Block* b, const diy::Master::ProxyWithLink&) {
+            if (!b->temporalBoundaryPts.empty())
+                local_active = 1;
+        });
+        int active_sum = 0;
+        diy::mpi::all_reduce(world, local_active, active_sum, std::plus<int>());
+        if (active_sum == 0)
+            break;
 
         // Use the reader's actual global offset to determine if more data exists.
         // This correctly handles file-boundary clamping that would cause windowStart to drift.
