@@ -7,7 +7,7 @@
 # Note: to use this QOS, your PI or PI Proxy needs to grant you access
 #SBATCH -q regular
 #SBATCH -J Pathline
-#SBATCH --mail-user=chen.10522@osu.edu
+#SBATCH --mail-user=yang.5039@osu.edu
 #SBATCH --mail-type=ALL
 #SBATCH -A m4259
 #SBATCH -t 6:0:0

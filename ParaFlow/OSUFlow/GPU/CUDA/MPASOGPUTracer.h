@@ -50,11 +50,17 @@ void TraceParticles(MPASOGrid*       grid,
                     int*             final_cell_out = nullptr,
                     int              save_interval = 1,
                     int              max_saved_points = 0,
-                    int*             saved_counts_out = nullptr);
+                    int*             saved_counts_out = nullptr,
+                    float*           kernel_ms_out = nullptr);  // CUDA Event kernel time (ms), accumulated
 
 // Pathline batch tracer. Like TraceParticles, but per-seed start times and
 // temporal velocity blending. The uploaded window's timestamps come from
 // Solution::getTimestamps() / MPASOGrid::getZTopTimestamps (real seconds).
+//
+// save_interval:     record one point every N steps (default 1 = every step)
+// max_saved_points:  capacity per particle row in traces_out; 0 = auto-compute
+// saved_counts_out:  actual saved points per particle (optional)
+// traces_out layout: [P * max_saved_points_eff] row-major, row 0 = seed
 void TracePathlineBatch(MPASOGrid*       grid,
                         Solution*        pSolution,
                         Solution*        vSolution,
@@ -65,10 +71,14 @@ void TracePathlineBatch(MPASOGrid*       grid,
                         int              n_particles,
                         int              n_steps,
                         double           dt,
-                        VECTOR3*         traces_out,        // [P * (n_steps + 1)]
+                        VECTOR3*         traces_out,
                         double*          final_time_out,    // [P]
                         int*             steps_taken_out,   // [P]
-                        int*             final_cell_out);   // [P], local cell id or -1
+                        int*             final_cell_out,    // [P], local cell id or -1
+                        int              save_interval = 1,
+                        int              max_saved_points = 0,
+                        int*             saved_counts_out = nullptr,
+                        float*           kernel_ms_out = nullptr);  // CUDA Event kernel time (ms)
 
 } // namespace mpaso_gpu_host
 

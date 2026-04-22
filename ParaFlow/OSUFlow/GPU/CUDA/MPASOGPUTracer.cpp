@@ -67,7 +67,8 @@ void TraceParticles(MPASOGrid*      grid,
                     int*            final_cell_out,
                     int             save_interval,
                     int             max_saved_points,
-                    int*            saved_counts_out)
+                    int*            saved_counts_out,
+                    float*          kernel_ms_out)
 {
     if (grid == nullptr || pSolution == nullptr || vSolution == nullptr) return;
     if (n_particles <= 0 || n_steps <= 0) return;
@@ -124,7 +125,8 @@ void TraceParticles(MPASOGrid*      grid,
         final_cell_out,
         save_interval,
         max_saved_points,
-        saved_counts_out);
+        saved_counts_out,
+        kernel_ms_out);
 
     field.release();
 }
@@ -142,7 +144,11 @@ void TracePathlineBatch(MPASOGrid*      grid,
                         VECTOR3*        traces_out,
                         double*         final_time_out,
                         int*            steps_taken_out,
-                        int*            final_cell_out)
+                        int*            final_cell_out,
+                        int             save_interval,
+                        int             max_saved_points,
+                        int*            saved_counts_out,
+                        float*          kernel_ms_out)
 {
     if (grid == nullptr || pSolution == nullptr || vSolution == nullptr) return;
     if (n_particles <= 0 || n_steps <= 0) return;
@@ -191,7 +197,11 @@ void TracePathlineBatch(MPASOGrid*      grid,
         reinterpret_cast<mpaso_vec3*>(traces_out),
         final_time_out,
         steps_taken_out,
-        final_cell_out);
+        final_cell_out,
+        save_interval,
+        max_saved_points,
+        saved_counts_out,
+        kernel_ms_out);
 
     field.release();
 }

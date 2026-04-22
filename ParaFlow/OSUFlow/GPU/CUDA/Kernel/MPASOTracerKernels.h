@@ -29,13 +29,20 @@ void LaunchTracer(const MPASODeviceField& field,
                   int*              h_final_cell_out = nullptr,
                   int               save_interval = 1,
                   int               max_saved_points = 0,
-                  int*              h_saved_counts_out = nullptr);
+                  int*              h_saved_counts_out = nullptr,
+                  float*            kernel_ms_out = nullptr);  // CUDA Event kernel time (ms), accumulated
 
 // Pathline launcher. Velocity is blended between two timesteps of the uploaded
 // window based on each particle's current time. Each particle starts at its
 // own t (from h_seed_t_start) and advances by dt per RK4 step.
-// Outputs: per-particle full trajectory, final time, and steps actually taken
+// Outputs: per-particle downsampled trajectory, final time, and steps taken
 // before either completing n_steps or failing a sample.
+//
+// save_interval:    record one point every N steps (1 = every step)
+// max_saved_points: capacity of each row in h_traces_out; 0 = auto-compute as
+//                   n_steps / save_interval + 2
+// h_saved_counts_out: actual saved point count per particle (optional)
+// h_traces_out layout: [P * max_saved_points_eff] (row-major, row 0 = seed)
 void LaunchPathlineTracer(const MPASODeviceField& field,
                           const mpaso_vec3* h_seeds,
                           const int*        h_seed_cell_id,
@@ -44,10 +51,14 @@ void LaunchPathlineTracer(const MPASODeviceField& field,
                           int               n_particles,
                           int               n_steps,
                           double            dt,
-                          mpaso_vec3*       h_traces_out,        // [P * (n_steps + 1)]
+                          mpaso_vec3*       h_traces_out,
                           double*           h_final_time_out,    // [P]
                           int*              h_steps_taken_out,   // [P]
-                          int*              h_final_cell_out);   // [P], local cell id or -1
+                          int*              h_final_cell_out,    // [P], local cell id or -1
+                          int               save_interval = 1,
+                          int               max_saved_points = 0,
+                          int*              h_saved_counts_out = nullptr,
+                          float*            kernel_ms_out = nullptr);  // CUDA Event kernel time (ms)
 } // namespace mpaso_gpu
 
 #endif // MPASO_TRACER_KERNELS_H

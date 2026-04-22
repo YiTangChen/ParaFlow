@@ -36,6 +36,8 @@ Thumbs.db
 /block_outputs/
 /seeds/
 /results/
+/NERSC_job/
+/partition/
 
 # Generated figures
 *.png

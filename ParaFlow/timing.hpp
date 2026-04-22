@@ -23,6 +23,9 @@ struct BlockTiming {
     long   n_steps_total        = 0;    // total RK4 integration steps completed
     int    n_particles_received = 0;    // particles received from neighbor blocks
 
+    // GPU-specific timing (zero on CPU-only runs)
+    double t_gpu_kernel_ms      = 0.0;  // pure CUDA kernel time (CUDA Events), accumulated across all launches
+
     // Memory measurements (computed once at init, analytical formula)
     size_t mem_grid_bytes       = 0;    // MPASOGrid: topology arrays + coordinates
     size_t mem_solution_bytes   = 0;    // Solution: velocity field data (scales with timesteps)

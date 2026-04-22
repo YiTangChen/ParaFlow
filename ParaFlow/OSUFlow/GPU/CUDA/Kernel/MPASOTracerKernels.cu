@@ -285,7 +285,8 @@ void LaunchTracer(const MPASODeviceField& field,
                   int*              h_final_cell_out,
                   int               save_interval,
                   int               max_saved_points,
-                  int*              h_saved_counts_out)
+                  int*              h_saved_counts_out,
+                  float*            kernel_ms_out)
 {
     if (n_particles <= 0 || n_steps <= 0) return;
 
@@ -334,13 +335,25 @@ void LaunchTracer(const MPASODeviceField& field,
 
     const int block = 128;
     const int grid  = (n_particles + block - 1) / block;
+    cudaEvent_t ev_start, ev_stop;
+    cudaCheck(cudaEventCreate(&ev_start), "event create start");
+    cudaCheck(cudaEventCreate(&ev_stop),  "event create stop");
+    cudaCheck(cudaEventRecord(ev_start),  "event record start");
     kernelTraceRK4<<<grid, block>>>(field, d_seeds, d_seed_cell_id, d_max_steps, d_step_offset,
                                     n_particles, n_steps, dt, t_start,
                                     use_euler, d_traces,
                                     d_steps_taken, d_final_cell,
                                     save_interval_eff, max_saved_eff, d_saved_counts);
-    cudaCheck(cudaGetLastError(),       "kernel launch");
-    cudaCheck(cudaDeviceSynchronize(),  "kernel sync");
+    cudaCheck(cudaGetLastError(),        "kernel launch");
+    cudaCheck(cudaEventRecord(ev_stop),  "event record stop");
+    cudaCheck(cudaEventSynchronize(ev_stop), "event sync");
+    if (kernel_ms_out) {
+        float ms = 0.0f;
+        cudaCheck(cudaEventElapsedTime(&ms, ev_start, ev_stop), "event elapsed");
+        *kernel_ms_out += ms;
+    }
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
 
     cudaCheck(cudaMemcpy(h_traces_out, d_traces, trace_bytes, cudaMemcpyDeviceToHost), "copy traces");
     if (h_steps_taken_out)
@@ -473,11 +486,14 @@ __device__ bool rk4_step_pathline(mpaso_vec3& p,
 
 // Main pathline kernel.
 // Per-particle inputs: seed position, cell hint, start time.
-// Per-particle outputs:
-//   traces_out[P * (n_steps + 1)] — full RK4 trajectory (row 0 = seed).
-//   final_time_out[P]             — last successful sample time (= t_start + k*dt)
-//   steps_taken_out[P]            — number of successful steps before giving up
-// Termination per particle: (a) n_steps reached, (b) sample fails.
+// Per-particle outputs (row = gid * max_saved_points):
+//   traces_out   — downsampled trajectory; one point every save_interval steps
+//                  plus the final position; remainder padded with final point.
+//   final_time_out[P]    — simulation time after the last successful step
+//   steps_taken_out[P]   — RK4 steps completed before termination
+//   final_cell_out[P]    — local cell id at termination (-1 = outside domain)
+//   saved_counts_out[P]  — actual points written into traces_out row (optional)
+// Termination: (a) n_steps reached, (b) time window exhausted, (c) sample fails.
 __global__ void kernelTracePathline(MPASODeviceField f,
                                     const mpaso_vec3* seeds,
                                     const int*        seed_cell_id,
@@ -489,53 +505,65 @@ __global__ void kernelTracePathline(MPASODeviceField f,
                                     mpaso_vec3*       traces_out,
                                     double*           final_time_out,
                                     int*              steps_taken_out,
-                                    int*              final_cell_out)
+                                    int*              final_cell_out,
+                                    int               save_interval,
+                                    int               max_saved_points,
+                                    int*              saved_counts_out)
 {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= n_particles) return;
 
-    const int row   = gid * (n_steps + 1);
+    const int row   = gid * max_saved_points;
     mpaso_vec3 p    = seeds[gid];
     int cell_id     = seed_cell_id[gid];
     double t        = seed_t_start[gid];
     int max_steps_for_seed = seed_max_steps[gid];
-    traces_out[row] = p;
+    int saved_count = 0;
+    trace_save_point(traces_out, row, max_saved_points, &saved_count, p);
 
     int steps_taken = 0;
     if (max_steps_for_seed <= 0) {
-        for (int k = 1; k <= n_steps; ++k) traces_out[row + k] = p;
+        trace_pad_points(traces_out, row, max_saved_points, saved_count, p);
         final_time_out[gid]  = t;
         steps_taken_out[gid] = 0;
         final_cell_out[gid]  = cell_id;
+        if (saved_counts_out) saved_counts_out[gid] = saved_count;
         return;
     }
 
     for (int s = 0; s < n_steps && s < max_steps_for_seed; ++s) {
         if (f.n_timesteps_loaded > 1 &&
             t + dt > f.d_timestamps[f.n_timesteps_loaded - 1] + 1.0e-9) {
-            for (int k = s + 1; k <= n_steps; ++k) traces_out[row + k] = p;
+            trace_save_final(traces_out, row, max_saved_points, &saved_count, p);
+            trace_pad_points(traces_out, row, max_saved_points, saved_count, p);
             final_time_out[gid]  = t;
             steps_taken_out[gid] = steps_taken;
             final_cell_out[gid]  = cell_id;
+            if (saved_counts_out) saved_counts_out[gid] = saved_count;
             return;
         }
         int prev_cell = cell_id;
         bool ok = rk4_step_pathline(p, &cell_id, dt, t, f);
         if (!ok || cell_id < 0) {
-            for (int k = s + 1; k <= n_steps; ++k) traces_out[row + k] = p;
-            final_time_out[gid]  = t;            // time of last successful state
+            trace_save_final(traces_out, row, max_saved_points, &saved_count, p);
+            trace_pad_points(traces_out, row, max_saved_points, saved_count, p);
+            final_time_out[gid]  = t;
             steps_taken_out[gid] = steps_taken;
             final_cell_out[gid]  = prev_cell;
+            if (saved_counts_out) saved_counts_out[gid] = saved_count;
             return;
         }
         t += dt;
         ++steps_taken;
-        traces_out[row + s + 1] = p;
+        if ((steps_taken % save_interval) == 0)
+            trace_save_point(traces_out, row, max_saved_points, &saved_count, p);
     }
-    for (int k = steps_taken + 1; k <= n_steps; ++k) traces_out[row + k] = p;
+    trace_save_final(traces_out, row, max_saved_points, &saved_count, p);
+    trace_pad_points(traces_out, row, max_saved_points, saved_count, p);
     final_time_out[gid]  = t;
     steps_taken_out[gid] = steps_taken;
     final_cell_out[gid]  = cell_id;
+    if (saved_counts_out) saved_counts_out[gid] = saved_count;
 }
 
 } // namespace
@@ -553,23 +581,33 @@ void LaunchPathlineTracer(const MPASODeviceField& field,
                           mpaso_vec3*       h_traces_out,
                           double*           h_final_time_out,
                           int*              h_steps_taken_out,
-                          int*              h_final_cell_out)
+                          int*              h_final_cell_out,
+                          int               save_interval,
+                          int               max_saved_points,
+                          int*              h_saved_counts_out,
+                          float*            kernel_ms_out)
 {
     if (n_particles <= 0 || n_steps <= 0) return;
 
-    mpaso_vec3* d_seeds       = nullptr;
-    int*        d_cell        = nullptr;
-    int*        d_max_steps   = nullptr;
-    double*     d_t_start     = nullptr;
-    mpaso_vec3* d_traces      = nullptr;
-    double*     d_final_time  = nullptr;
-    int*        d_steps_taken = nullptr;
-    int*        d_final_cell  = nullptr;
+    const int save_interval_eff = save_interval > 0 ? save_interval : 1;
+    const int max_saved_eff = max_saved_points > 0
+        ? max_saved_points
+        : n_steps / save_interval_eff + 2;
+
+    mpaso_vec3* d_seeds        = nullptr;
+    int*        d_cell         = nullptr;
+    int*        d_max_steps    = nullptr;
+    double*     d_t_start      = nullptr;
+    mpaso_vec3* d_traces       = nullptr;
+    double*     d_final_time   = nullptr;
+    int*        d_steps_taken  = nullptr;
+    int*        d_final_cell   = nullptr;
+    int*        d_saved_counts = nullptr;
 
     const size_t sb  = (size_t)n_particles * sizeof(mpaso_vec3);
     const size_t cb  = (size_t)n_particles * sizeof(int);
     const size_t db  = (size_t)n_particles * sizeof(double);
-    const size_t tb  = (size_t)n_particles * (size_t)(n_steps + 1) * sizeof(mpaso_vec3);
+    const size_t tb  = (size_t)n_particles * (size_t)max_saved_eff * sizeof(mpaso_vec3);
 
     cudaCheck(cudaMalloc(&d_seeds,       sb), "pl alloc seeds");
     cudaCheck(cudaMalloc(&d_cell,        cb), "pl alloc cell");
@@ -579,29 +617,45 @@ void LaunchPathlineTracer(const MPASODeviceField& field,
     cudaCheck(cudaMalloc(&d_final_time,  db), "pl alloc final_time");
     cudaCheck(cudaMalloc(&d_steps_taken, cb), "pl alloc steps_taken");
     cudaCheck(cudaMalloc(&d_final_cell,  cb), "pl alloc final_cell");
+    if (h_saved_counts_out)
+        cudaCheck(cudaMalloc(&d_saved_counts, cb), "pl alloc saved_counts");
 
-    cudaCheck(cudaMemcpy(d_seeds,   h_seeds,        sb, cudaMemcpyHostToDevice), "pl cpy seeds");
-    cudaCheck(cudaMemcpy(d_cell,    h_seed_cell_id, cb, cudaMemcpyHostToDevice), "pl cpy cell");
-    cudaCheck(cudaMemcpy(d_max_steps, h_seed_max_steps, cb, cudaMemcpyHostToDevice), "pl cpy max_steps");
-    cudaCheck(cudaMemcpy(d_t_start, h_seed_t_start, db, cudaMemcpyHostToDevice), "pl cpy t_start");
+    cudaCheck(cudaMemcpy(d_seeds,     h_seeds,           sb, cudaMemcpyHostToDevice), "pl cpy seeds");
+    cudaCheck(cudaMemcpy(d_cell,      h_seed_cell_id,    cb, cudaMemcpyHostToDevice), "pl cpy cell");
+    cudaCheck(cudaMemcpy(d_max_steps, h_seed_max_steps,  cb, cudaMemcpyHostToDevice), "pl cpy max_steps");
+    cudaCheck(cudaMemcpy(d_t_start,   h_seed_t_start,    db, cudaMemcpyHostToDevice), "pl cpy t_start");
 
     const int block = 128;
     const int grid  = (n_particles + block - 1) / block;
+    cudaEvent_t ev_start, ev_stop;
+    cudaCheck(cudaEventCreate(&ev_start), "pl event create start");
+    cudaCheck(cudaEventCreate(&ev_stop),  "pl event create stop");
+    cudaCheck(cudaEventRecord(ev_start),  "pl event record start");
     kernelTracePathline<<<grid, block>>>(field, d_seeds, d_cell, d_t_start, d_max_steps,
-                                          n_particles, n_steps, dt,
-                                          d_traces, d_final_time, d_steps_taken,
-                                          d_final_cell);
-    cudaCheck(cudaGetLastError(),      "pl kernel launch");
-    cudaCheck(cudaDeviceSynchronize(), "pl kernel sync");
+                                         n_particles, n_steps, dt,
+                                         d_traces, d_final_time, d_steps_taken, d_final_cell,
+                                         save_interval_eff, max_saved_eff, d_saved_counts);
+    cudaCheck(cudaGetLastError(),            "pl kernel launch");
+    cudaCheck(cudaEventRecord(ev_stop),      "pl event record stop");
+    cudaCheck(cudaEventSynchronize(ev_stop), "pl event sync");
+    if (kernel_ms_out) {
+        float ms = 0.0f;
+        cudaCheck(cudaEventElapsedTime(&ms, ev_start, ev_stop), "pl event elapsed");
+        *kernel_ms_out += ms;
+    }
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
 
     cudaCheck(cudaMemcpy(h_traces_out,      d_traces,      tb, cudaMemcpyDeviceToHost), "pl cpy traces");
     cudaCheck(cudaMemcpy(h_final_time_out,  d_final_time,  db, cudaMemcpyDeviceToHost), "pl cpy final_time");
     cudaCheck(cudaMemcpy(h_steps_taken_out, d_steps_taken, cb, cudaMemcpyDeviceToHost), "pl cpy steps_taken");
     cudaCheck(cudaMemcpy(h_final_cell_out,  d_final_cell,  cb, cudaMemcpyDeviceToHost), "pl cpy final_cell");
+    if (h_saved_counts_out)
+        cudaCheck(cudaMemcpy(h_saved_counts_out, d_saved_counts, cb, cudaMemcpyDeviceToHost), "pl cpy saved_counts");
 
     cudaFree(d_seeds); cudaFree(d_cell); cudaFree(d_max_steps); cudaFree(d_t_start);
-    cudaFree(d_traces); cudaFree(d_final_time); cudaFree(d_steps_taken);
-    cudaFree(d_final_cell);
+    cudaFree(d_traces); cudaFree(d_final_time); cudaFree(d_steps_taken); cudaFree(d_final_cell);
+    cudaFree(d_saved_counts);
 }
 
 } // namespace mpaso_gpu

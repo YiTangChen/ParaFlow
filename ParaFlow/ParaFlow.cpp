@@ -375,6 +375,8 @@ static void run_gpu_pathline_parity_test(Block* b, int rank)
     std::vector<int>     gpu_seed_max_steps(n_particles, n_steps);
     std::fprintf(stderr, "[GPU pathline parity] launching: P=%d, steps=%d, dt=%.1f, t_start=%.3e\n",
                  n_particles, n_steps, dt, t_start);
+    // save_interval=1, max_saved_points=n_steps+1: store every step so the
+    // step-by-step CPU/GPU comparison below works with the same row stride.
     mpaso_gpu_host::TracePathlineBatch(grid, pSol, vSol,
                                        seeds.data(), seed_cells.data(), seed_t_start.data(),
                                        gpu_seed_max_steps.data(),
@@ -382,7 +384,9 @@ static void run_gpu_pathline_parity_test(Block* b, int rank)
                                        gpu_trace.data(),
                                        gpu_final_time.data(),
                                        gpu_steps_taken.data(),
-                                       gpu_final_cell.data());
+                                       gpu_final_cell.data(),
+                                       /*save_interval=*/1,
+                                       /*max_saved_points=*/n_steps + 1);
 
     // ---- compare ----
     double max_abs = 0.0, max_rel = 0.0;
@@ -821,6 +825,7 @@ void ParaFlow::trace_block_gpu(Block*                             b,
             }
         }
 
+        float  chunk_kernel_ms = 0.0f;
         double _t_comp = pf_now(enable_timing);
         while (active_count > 0)
         {
@@ -872,7 +877,8 @@ void ParaFlow::trace_block_gpu(Block*                             b,
                                            gpu_final_cell.data(),
                                            saveInterval,
                                            maxSaved,
-                                           gpu_saved_counts.data());
+                                           gpu_saved_counts.data(),
+                                           enable_timing ? &chunk_kernel_ms : nullptr);
 
             for (int j = 0; j < n_launch; j++)
             {
@@ -951,6 +957,7 @@ void ParaFlow::trace_block_gpu(Block*                             b,
             }
         }
         pf_accum(b->timing.t_trace_compute, _t_comp, enable_timing);
+        if (enable_timing) b->timing.t_gpu_kernel_ms += chunk_kernel_ms;
 
         b->sl_stepcounts = total_steps_taken;
         if (enable_timing)
@@ -1058,6 +1065,10 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
                 "TIMING phase=trace_compute rank=%d gid=%d t=%.6f nsteps=%ld nrecv=%d\n",
                 b->rank, cp.gid(), b->timing.t_trace_compute,
                 b->timing.n_steps_total, b->timing.n_particles_received);
+            if (b->timing.t_gpu_kernel_ms > 0.0)
+                fprintf(stderr,
+                    "TIMING phase=gpu_kernel    rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_gpu_kernel_ms / 1000.0);
             fprintf(stderr,
                 "TIMING phase=trace_comm    rank=%d gid=%d t=%.6f\n",
                 b->rank, cp.gid(), b->timing.t_trace_comm);
@@ -1267,10 +1278,13 @@ void ParaFlow::trace_block_pathline_gpu(Block*                              b,
                 seed_cells[i] = ci.inCell / b->nVertLevels;
         }
 
-        std::vector<VECTOR3> gpu_trace((size_t)n_particles * (n_steps + 1));
+        const int max_saved_points = n_steps / this->interval + 2;
+        std::vector<VECTOR3> gpu_trace((size_t)n_particles * max_saved_points);
         std::vector<double>  gpu_final_time(n_particles, 0.0);
         std::vector<int>     gpu_steps_taken(n_particles, 0);
         std::vector<int>     gpu_final_cell(n_particles, -1);
+        std::vector<int>     gpu_saved_counts(n_particles, 0);
+        float gpu_kernel_ms = 0.0f;
 
         double _t_comp = pf_now(enable_timing);
         mpaso_gpu_host::TracePathlineBatch(grid, pSol, vSol,
@@ -1284,8 +1298,13 @@ void ParaFlow::trace_block_pathline_gpu(Block*                              b,
                                            gpu_trace.data(),
                                            gpu_final_time.data(),
                                            gpu_steps_taken.data(),
-                                           gpu_final_cell.data());
+                                           gpu_final_cell.data(),
+                                           this->interval,
+                                           max_saved_points,
+                                           gpu_saved_counts.data(),
+                                           enable_timing ? &gpu_kernel_ms : nullptr);
         pf_accum(b->timing.t_trace_compute, _t_comp, enable_timing);
+        if (enable_timing) b->timing.t_gpu_kernel_ms += gpu_kernel_ms;
 
         b->pl_stepcounts = gpu_steps_taken;
         b->toCells.assign(n_particles, -1);
@@ -1300,12 +1319,10 @@ void ParaFlow::trace_block_pathline_gpu(Block*                              b,
             currseg.sid    = b->startPts[seedCnt].sid;
             currseg.nsteps = b->startPts[seedCnt].nsteps + gpu_steps_taken[seedCnt];
 
-            int steps = gpu_steps_taken[seedCnt];
-            int row = seedCnt * (n_steps + 1);
-            for (int s = 0; s <= steps; s++) {
-                if (s == 0 || s == steps || (s % this->interval) == 0)
-                    currseg.coords.push_back(gpu_trace[row + s]);
-            }
+            int saved = gpu_saved_counts[seedCnt];
+            int row = seedCnt * max_saved_points;
+            for (int s = 0; s < saved; s++)
+                currseg.coords.push_back(gpu_trace[row + s]);
 
             if (currseg.coords.empty())
                 continue;
@@ -1488,6 +1505,10 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
                 "TIMING phase=trace_compute rank=%d gid=%d t=%.6f nsteps=%ld nrecv=%d\n",
                 b->rank, cp.gid(), b->timing.t_trace_compute,
                 b->timing.n_steps_total, b->timing.n_particles_received);
+            if (b->timing.t_gpu_kernel_ms > 0.0)
+                fprintf(stderr,
+                    "TIMING phase=gpu_kernel    rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_gpu_kernel_ms / 1000.0);
             fprintf(stderr,
                 "TIMING phase=trace_comm    rank=%d gid=%d t=%.6f\n",
                 b->rank, cp.gid(), b->timing.t_trace_comm);
