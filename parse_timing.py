@@ -20,9 +20,12 @@ Usage:
 
     # reset output files first (fresh experiment)
     python3 parse_timing.py --reset logs/*.stderr
-    
+
     # parse files with non-standard names (override n_blocks/n_seeds/run_id)
     python3 parse_timing.py --blocks=256 --seeds=10000 --run=1 slurm-51151129.out
+
+    # specify device and mesh type
+    python3 parse_timing.py --blocks=16 --seeds=10000 --device=gpu --mesh=lowres run.err
 """
 
 import re
@@ -34,16 +37,17 @@ from collections import defaultdict
 
 
 # ─── output file paths ────────────────────────────────────────────────────────
-RESULTS_DIR    = Path("results/slurm1129")  # adjust as needed
+RESULTS_DIR    = Path("results/gpu_analysis")
 SUMMARY_CSV    = RESULTS_DIR / "run_summary.csv"
 BLOCK_CSV      = RESULTS_DIR / "block_detail.csv"
 
 SUMMARY_FIELDS = [
-    "n_blocks", "n_seeds", "run_id",
+    "n_blocks", "n_seeds", "run_id", "device", "mesh",
     "t_seed_read",
     "t_seed_bcast_min", "t_seed_bcast_max", "t_seed_bcast_avg",
     "t_blockload_min",  "t_blockload_max",  "t_blockload_avg",
     "t_compute_min",    "t_compute_max",    "t_compute_avg",
+    "t_gpukernel_min",  "t_gpukernel_max",  "t_gpukernel_avg",
     "t_comm_min",       "t_comm_max",       "t_comm_avg",
     "t_write_min",      "t_write_max",      "t_write_avg",
     "t_iex_min",        "t_iex_max",        "t_iex_avg",
@@ -56,9 +60,9 @@ SUMMARY_FIELDS = [
 ]
 
 BLOCK_FIELDS = [
-    "n_blocks", "n_seeds", "run_id", "gid", "rank",
-    "t_block_load", "t_trace_compute", "t_trace_comm", "t_output_write",
-    "t_trace_idle",          # derived: t_iex_total_rank - t_compute - t_comm
+    "n_blocks", "n_seeds", "run_id", "device", "mesh", "gid", "rank",
+    "t_block_load", "t_trace_compute", "t_gpu_kernel", "t_trace_comm", "t_output_write",
+    "t_trace_idle",
     "n_seeds_initial", "n_steps_total", "n_particles_received",
     "mem_grid_bytes", "mem_solution_bytes", "mem_total_bytes",
     "mem_delta_kb", "mem_peak_vmhwm_kb",
@@ -76,12 +80,14 @@ def parse_log(path: str):
     Read one log file and return:
         global_timing  — dict of scalar values from non-block lines
         blocks         — dict keyed by gid, each a dict of accumulated values
+        has_gpu        — True if gpu_kernel lines were found
     """
-    global_timing = {}   # seed_read, seed_bcast list, iexchange_global
-    blocks = defaultdict(dict)  # gid -> field -> value
+    global_timing = {}
+    blocks = defaultdict(dict)
 
-    seed_bcasts = []     # one entry per rank
-    iex_totals  = []     # one entry per rank
+    seed_bcasts = []
+    iex_totals  = []
+    has_gpu     = False
 
     with open(path) as f:
         for line in f:
@@ -109,18 +115,22 @@ def parse_log(path: str):
                 iex_totals.append((int(kv.get("rank", 0)), float(kv.get("t", 0))))
 
             # ── per-block lines ────────────────────────────────────────────
-            elif phase in ("block_load", "trace_compute", "trace_comm", "output_write"):
+            elif phase in ("block_load", "trace_compute", "gpu_kernel",
+                           "trace_comm", "output_write"):
                 gid = int(kv.get("gid", -1))
                 b   = blocks[gid]
                 b["gid"]  = gid
                 b["rank"] = int(kv.get("rank", 0))
                 if phase == "block_load":
-                    b["t_block_load"]   = float(kv.get("t", 0))
+                    b["t_block_load"]    = float(kv.get("t", 0))
                     b["n_seeds_initial"] = int(kv.get("nseeds", 0))
                 elif phase == "trace_compute":
                     b["t_trace_compute"]      = float(kv.get("t", 0))
                     b["n_steps_total"]        = int(kv.get("nsteps", 0))
                     b["n_particles_received"] = int(kv.get("nrecv", 0))
+                elif phase == "gpu_kernel":
+                    b["t_gpu_kernel"] = float(kv.get("t", 0))
+                    has_gpu = True
                 elif phase == "trace_comm":
                     b["t_trace_comm"] = float(kv.get("t", 0))
                 elif phase == "output_write":
@@ -138,21 +148,18 @@ def parse_log(path: str):
 
             elif line.startswith("MEM_PEAK"):
                 gid = int(kv.get("gid", -1))
-                # Support both key=value format (vmhwm_kb=N) and
-                # /proc/status format (VmHWM:\t<N> kB)
                 vmhwm = kv.get("vmhwm_kb")
                 if vmhwm is None:
                     m = re.search(r'VmHWM:\s*(\d+)', line)
                     vmhwm = m.group(1) if m else 0
                 blocks[gid]["mem_peak_vmhwm_kb"] = int(vmhwm)
 
-    # Store per-rank iexchange total on each block (same rank = same iex time)
     rank_to_iex = {rank: t for rank, t in iex_totals}
     for gid, b in blocks.items():
         b["t_iex_rank"] = rank_to_iex.get(b.get("rank", 0), 0.0)
 
     global_timing["seed_bcasts"] = seed_bcasts
-    return global_timing, blocks
+    return global_timing, blocks, has_gpu
 
 
 def _stats(values):
@@ -163,19 +170,14 @@ def _stats(values):
 
 
 def extract_n_blocks_n_seeds(path: str):
-    """
-    Extract n_blocks and n_seeds from filename convention:
-        b<nblocks>_s<nseeds>_run<N>.stderr
-    Returns (n_blocks, n_seeds, run_id) as ints, or (None, None, None).
-    """
-    name = Path(path).stem   # e.g. b016_s010000_run1
+    name = Path(path).stem
     m = re.match(r'b(\d+)_s(\d+)_run(\d+)', name)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
     return None, None, None
 
 
-def build_summary_row(n_blocks, n_seeds, run_id, global_timing, blocks):
+def build_summary_row(n_blocks, n_seeds, run_id, device, mesh, global_timing, blocks):
     bdata = list(blocks.values())
 
     def col(field):
@@ -185,15 +187,18 @@ def build_summary_row(n_blocks, n_seeds, run_id, global_timing, blocks):
     bc_min, bc_max, bc_avg = _stats(bcasts)
     bl_min, bl_max, bl_avg = _stats(col("t_block_load"))
     co_min, co_max, co_avg = _stats(col("t_trace_compute"))
+    gk_min, gk_max, gk_avg = _stats([v for v in col("t_gpu_kernel") if v > 0])
     cm_min, cm_max, cm_avg = _stats(col("t_trace_comm"))
     wr_min, wr_max, wr_avg = _stats(col("t_output_write"))
 
     return {
         "n_blocks": n_blocks, "n_seeds": n_seeds, "run_id": run_id,
+        "device": device, "mesh": mesh,
         "t_seed_read":        global_timing.get("t_seed_read", 0),
         "t_seed_bcast_min": bc_min, "t_seed_bcast_max": bc_max, "t_seed_bcast_avg": bc_avg,
         "t_blockload_min":  bl_min, "t_blockload_max":  bl_max, "t_blockload_avg":  bl_avg,
         "t_compute_min":    co_min, "t_compute_max":    co_max, "t_compute_avg":    co_avg,
+        "t_gpukernel_min":  gk_min, "t_gpukernel_max":  gk_max, "t_gpukernel_avg":  gk_avg,
         "t_comm_min":       cm_min, "t_comm_max":       cm_max, "t_comm_avg":       cm_avg,
         "t_write_min":      wr_min, "t_write_max":      wr_max, "t_write_avg":      wr_avg,
         "t_iex_min":     global_timing.get("iex_min", 0),
@@ -218,19 +223,21 @@ def build_summary_row(n_blocks, n_seeds, run_id, global_timing, blocks):
     }
 
 
-def build_block_rows(n_blocks, n_seeds, run_id, blocks):
+def build_block_rows(n_blocks, n_seeds, run_id, device, mesh, blocks):
     rows = []
     for gid, b in sorted(blocks.items()):
         t_comp = b.get("t_trace_compute", 0.0)
         t_comm = b.get("t_trace_comm",    0.0)
         t_iex  = b.get("t_iex_rank",      0.0)
-        t_idle = max(0.0, t_iex - t_comp - t_comm)   # derived
+        t_idle = max(0.0, t_iex - t_comp - t_comm)
         rows.append({
             "n_blocks": n_blocks, "n_seeds": n_seeds, "run_id": run_id,
+            "device": device, "mesh": mesh,
             "gid":  gid,
             "rank": b.get("rank", 0),
             "t_block_load":    b.get("t_block_load",   0.0),
             "t_trace_compute": t_comp,
+            "t_gpu_kernel":    b.get("t_gpu_kernel",   0.0),
             "t_trace_comm":    t_comm,
             "t_output_write":  b.get("t_output_write", 0.0),
             "t_trace_idle":    t_idle,
@@ -265,6 +272,8 @@ def main():
     override_blocks = None
     override_seeds  = None
     override_run    = None
+    override_device = None
+    override_mesh   = None
 
     filtered = []
     for a in args:
@@ -276,6 +285,10 @@ def main():
             override_seeds = int(a.split("=", 1)[1])
         elif a.startswith("--run="):
             override_run = int(a.split("=", 1)[1])
+        elif a.startswith("--device="):
+            override_device = a.split("=", 1)[1]
+        elif a.startswith("--mesh="):
+            override_mesh = a.split("=", 1)[1]
         else:
             filtered.append(a)
     args = filtered
@@ -298,22 +311,28 @@ def main():
                 n_seeds  = override_seeds
                 run_id   = override_run if override_run is not None else 1
             else:
-                print(f"WARN: cannot parse n_blocks/n_seeds from '{path}' — expected b<N>_s<N>_run<N>.stderr")
+                print(f"WARN: cannot parse n_blocks/n_seeds from '{path}'")
                 print(f"      Use --blocks=N --seeds=N [--run=N] to override.")
                 continue
 
-        global_timing, blocks = parse_log(path)
+        global_timing, blocks, has_gpu = parse_log(path)
 
-        summary_row  = build_summary_row(n_blocks, n_seeds, run_id, global_timing, blocks)
-        block_rows   = build_block_rows(n_blocks, n_seeds, run_id, blocks)
+        device = override_device if override_device else ("gpu" if has_gpu else "cpu")
+        mesh   = override_mesh   if override_mesh   else "lowres"
+
+        summary_row = build_summary_row(n_blocks, n_seeds, run_id, device, mesh,
+                                        global_timing, blocks)
+        block_rows  = build_block_rows(n_blocks, n_seeds, run_id, device, mesh, blocks)
 
         write_csv(SUMMARY_CSV, SUMMARY_FIELDS, [summary_row], append=not reset)
         write_csv(BLOCK_CSV,   BLOCK_FIELDS,   block_rows,    append=not reset)
-        reset = False   # only reset on first file
+        reset = False
 
-        print(f"[{Path(path).name}] n_blocks={n_blocks} n_seeds={n_seeds} "
+        print(f"[{Path(path).name}] device={device} mesh={mesh} "
+              f"n_blocks={n_blocks} n_seeds={n_seeds} "
               f"blocks_parsed={len(blocks)} "
-              f"iex_imbalance={summary_row['iex_imbalance']:.3f}")
+              f"iex_imbalance={summary_row['iex_imbalance']:.3f} "
+              f"wall={summary_row['t_iex_max']:.1f}s")
 
     print(f"\nOutputs:")
     print(f"  {SUMMARY_CSV}  ({SUMMARY_CSV.stat().st_size if SUMMARY_CSV.exists() else 0} bytes)")
