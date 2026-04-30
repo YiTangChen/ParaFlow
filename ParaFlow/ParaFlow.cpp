@@ -1007,14 +1007,17 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         if (enable_timing) {
             b->timing.n_seeds_initial      = (int)b->currentSeeds.size();
             b->timing.mem_vmrss_after_kb   = pf_read_vmrss_kb();
+            b->timing.n_local_cells        = b->nLocalCells;
+            b->timing.n_global_cells       = b->nGlobalCells;
             MPASOGrid* grid = dynamic_cast<MPASOGrid*>(b->osuflow->GetFlowField()->GetGrid());
             if (grid) {
                 b->timing.mem_grid_bytes     = grid->getGridMemBytes();
                 b->timing.mem_solution_bytes = grid->getSolutionMemBytes();
-                // Add Block-owned index arrays (not visible to MPASOGrid)
-                // b->timing.mem_grid_bytes    += (size_t)b->nLocalCells  * sizeof(int); // LocalCell2GlobalCell
-                // b->timing.mem_grid_bytes    += (size_t)b->nGlobalCells * sizeof(int); // GlobalCell2LocalCell
-                // b->timing.mem_grid_bytes    += (size_t)b->nGlobalCells * sizeof(int); // areaIndicesArr
+                // Block-owned index arrays (not visible to MPASOGrid)
+                b->timing.mem_grid_bytes    += (size_t)b->nLocalCells  * sizeof(int); // LocalCell2GlobalCell
+                b->timing.mem_grid_bytes    += (size_t)b->nGlobalCells * sizeof(int); // GlobalCell2LocalCell
+                b->timing.mem_grid_bytes    += (size_t)b->nGlobalCells * sizeof(int); // areaIndicesArr
+                b->timing.mem_grid_bytes    += b->areaID2neighborID.size() * sizeof(int); // areaID2neighborID
             }
         }
 
@@ -1088,6 +1091,9 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
             fprintf(stderr,
                 "MEM_PEAK       rank=%d gid=%d vmhwm_kb=%ld\n",
                 b->rank, cp.gid(), b->timing.mem_peak_vmhwm_kb);
+            fprintf(stderr,
+                "MEM_CELLCOUNT  rank=%d gid=%d n_local_cells=%d n_global_cells=%d\n",
+                b->rank, cp.gid(), b->timing.n_local_cells, b->timing.n_global_cells);
         });
         fprintf(stderr, "TIMING phase=iexchange_total rank=%d t=%.6f\n", rank, t_iexchange);
         double iex_min, iex_max, iex_sum;
@@ -1403,10 +1409,17 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
         if (enable_timing) {
             b->timing.n_seeds_initial      = (int)b->currentSeeds.size();
             b->timing.mem_vmrss_after_kb   = pf_read_vmrss_kb();
+            b->timing.n_local_cells        = b->nLocalCells;
+            b->timing.n_global_cells       = b->nGlobalCells;
             MPASOGrid* grid = dynamic_cast<MPASOGrid*>(b->osuflow->GetFlowField()->GetGrid());
             if (grid) {
                 b->timing.mem_grid_bytes     = grid->getGridMemBytes();
                 b->timing.mem_solution_bytes = grid->getSolutionMemBytes();
+                // Block-owned index arrays (not visible to MPASOGrid)
+                b->timing.mem_grid_bytes    += (size_t)b->nLocalCells  * sizeof(int); // LocalCell2GlobalCell
+                b->timing.mem_grid_bytes    += (size_t)b->nGlobalCells * sizeof(int); // GlobalCell2LocalCell
+                b->timing.mem_grid_bytes    += (size_t)b->nGlobalCells * sizeof(int); // areaIndicesArr
+                b->timing.mem_grid_bytes    += b->areaID2neighborID.size() * sizeof(int); // areaID2neighborID
             }
         }
 
@@ -1528,6 +1541,9 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
             fprintf(stderr,
                 "MEM_PEAK       rank=%d gid=%d vmhwm_kb=%ld\n",
                 b->rank, cp.gid(), b->timing.mem_peak_vmhwm_kb);
+            fprintf(stderr,
+                "MEM_CELLCOUNT  rank=%d gid=%d n_local_cells=%d n_global_cells=%d\n",
+                b->rank, cp.gid(), b->timing.n_local_cells, b->timing.n_global_cells);
         });
         fprintf(stderr, "TIMING phase=iexchange_total rank=%d t=%.6f\n", rank, t_iexchange);
         double iex_min, iex_max, iex_sum;

@@ -26,8 +26,12 @@ struct BlockTiming {
     // GPU-specific timing (zero on CPU-only runs)
     double t_gpu_kernel_ms      = 0.0;  // pure CUDA kernel time (CUDA Events), accumulated across all launches
 
+    // Cell counts (set at init, used to derive Block-owned index array sizes)
+    int    n_local_cells        = 0;    // number of cells owned by this block
+    int    n_global_cells       = 0;    // total cells in the global mesh
+
     // Memory measurements (computed once at init, analytical formula)
-    size_t mem_grid_bytes       = 0;    // MPASOGrid: topology arrays + coordinates
+    size_t mem_grid_bytes       = 0;    // MPASOGrid topology + coordinates + Block index arrays
     size_t mem_solution_bytes   = 0;    // Solution: velocity field data (scales with timesteps)
 
     // Memory measurements (OS-reported, from /proc/self/status)

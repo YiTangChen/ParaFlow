@@ -64,6 +64,7 @@ BLOCK_FIELDS = [
     "t_block_load", "t_trace_compute", "t_gpu_kernel", "t_trace_comm", "t_output_write",
     "t_trace_idle",
     "n_seeds_initial", "n_steps_total", "n_particles_received",
+    "n_local_cells", "n_global_cells",
     "mem_grid_bytes", "mem_solution_bytes", "mem_total_bytes",
     "mem_delta_kb", "mem_peak_vmhwm_kb",
 ]
@@ -145,6 +146,11 @@ def parse_log(path: str):
             elif line.startswith("MEM_DELTA"):
                 gid = int(kv.get("gid", -1))
                 blocks[gid]["mem_delta_kb"] = int(kv.get("delta_kb", 0))
+
+            elif line.startswith("MEM_CELLCOUNT"):
+                gid = int(kv.get("gid", -1))
+                blocks[gid]["n_local_cells"]  = int(kv.get("n_local_cells", 0))
+                blocks[gid]["n_global_cells"] = int(kv.get("n_global_cells", 0))
 
             elif line.startswith("MEM_PEAK"):
                 gid = int(kv.get("gid", -1))
@@ -244,6 +250,8 @@ def build_block_rows(n_blocks, n_seeds, run_id, device, mesh, blocks):
             "n_seeds_initial":      b.get("n_seeds_initial",      0),
             "n_steps_total":        b.get("n_steps_total",        0),
             "n_particles_received": b.get("n_particles_received", 0),
+            "n_local_cells":      b.get("n_local_cells",      0),
+            "n_global_cells":     b.get("n_global_cells",     0),
             "mem_grid_bytes":     b.get("mem_grid_bytes",     0),
             "mem_solution_bytes": b.get("mem_solution_bytes", 0),
             "mem_total_bytes":    b.get("mem_grid_bytes", 0) + b.get("mem_solution_bytes", 0),
