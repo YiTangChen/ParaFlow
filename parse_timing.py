@@ -26,6 +26,9 @@ Usage:
 
     # specify device and mesh type
     python3 parse_timing.py --blocks=16 --seeds=10000 --device=gpu --mesh=lowres run.err
+
+    # write to a different results directory (default: results/gpu_analysis)
+    python3 parse_timing.py --outdir=results/mem_scaling --blocks=32 --seeds=10000 run.err
 """
 
 import re
@@ -36,8 +39,9 @@ from pathlib import Path
 from collections import defaultdict
 
 
-# ─── output file paths ────────────────────────────────────────────────────────
-RESULTS_DIR    = Path("results/gpu_analysis")
+# ─── output file paths (overridden by --outdir at runtime) ───────────────────
+DEFAULT_RESULTS_DIR = Path("results/gpu_analysis")
+RESULTS_DIR    = DEFAULT_RESULTS_DIR   # may be replaced in main()
 SUMMARY_CSV    = RESULTS_DIR / "run_summary.csv"
 BLOCK_CSV      = RESULTS_DIR / "block_detail.csv"
 
@@ -275,6 +279,8 @@ def write_csv(path, fields, rows, append=True):
 
 # ─── main ─────────────────────────────────────────────────────────────────────
 def main():
+    global RESULTS_DIR, SUMMARY_CSV, BLOCK_CSV
+
     args = sys.argv[1:]
     reset = False
     override_blocks = None
@@ -297,6 +303,10 @@ def main():
             override_device = a.split("=", 1)[1]
         elif a.startswith("--mesh="):
             override_mesh = a.split("=", 1)[1]
+        elif a.startswith("--outdir="):
+            RESULTS_DIR = Path(a.split("=", 1)[1])
+            SUMMARY_CSV = RESULTS_DIR / "run_summary.csv"
+            BLOCK_CSV   = RESULTS_DIR / "block_detail.csv"
         else:
             filtered.append(a)
     args = filtered
