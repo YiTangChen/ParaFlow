@@ -1,0 +1,42 @@
+2026-05-07 08:16:52.408 (   2.562s) [    7F12F22C9B80]vtkXOpenGLRenderWindow.:1460  WARN| bad X server connection. DISPLAY=
+  Sim start: 0002-01-01_00:00:00  dt=60.0 min
+Reading pathlines: rendering/pathlines_10k_active.bin
+  2,802 pathlines loaded
+  2802 particles, 25583 max timesteps
+  Particle depth range: -0.0–1495.1 m  (clim set to 95th-pct = 155.4 m)
+Building ocean texture from /global/cfs/projectdirs/m4259/milena/forParticleTracing/mpaso.RRSwISC6to18E3r5.rstFromG-chrysalis.20240603.nc ...
+  Ocean coverage: 63.7% raw → 73.3% after gap-fill
+  Visible particles (front hemisphere): 1,740 / 2,802
+Rendering 1280 frames at 24 fps → /pscratch/sd/y/yang5039/paraflow_renders/pathlines_pacific_active_v2.mp4
+  Estimated duration: 53.3 s
+  Frame     0/1280  t=0
+  Frame    50/1280  t=1000
+  Frame   100/1280  t=2000
+  Frame   150/1280  t=3000
+  Frame   200/1280  t=4000
+  Frame   250/1280  t=5000
+  Frame   300/1280  t=6000
+  Frame   350/1280  t=7000
+  Frame   400/1280  t=8000
+  Frame   450/1280  t=9000
+  Frame   500/1280  t=10000
+  Frame   550/1280  t=11000
+  Frame   600/1280  t=12000
+  Frame   650/1280  t=13000
+  Frame   700/1280  t=14000
+  Frame   750/1280  t=15000
+  Frame   800/1280  t=16000
+  Frame   850/1280  t=17000
+  Frame   900/1280  t=18000
+  Frame   950/1280  t=19000
+  Frame  1000/1280  t=20000
+  Frame  1050/1280  t=21000
+  Frame  1100/1280  t=22000
+  Frame  1150/1280  t=23000
+  Frame  1200/1280  t=24000
+  Frame  1250/1280  t=25000
+Stitching (libx264): /pscratch/sd/y/yang5039/paraflow_renders/pathlines_pacific_active_v2.mp4
+  failed: Unknown encoder 'libx264'
+Stitching (libvpx-vp9): /pscratch/sd/y/yang5039/paraflow_renders/pathlines_pacific_active_v2.webm
+Done → /pscratch/sd/y/yang5039/paraflow_renders/pathlines_pacific_active_v2.webm
+  (PNG frames kept in /pscratch/sd/y/yang5039/paraflow_renders/pathlines_pacific_active_v2_frames/)

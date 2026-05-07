@@ -38,12 +38,15 @@ Thumbs.db
 /results/
 /NERSC_job/
 /partition/
+rendering/render_log_*.txt
 
 # Generated figures
 *.png
 *.pdf
 *.log
 *.csv
+*.webm
+*.bin
 
 # Graph partition files
 *.info.part.*
