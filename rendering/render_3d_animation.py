@@ -21,7 +21,7 @@ Usage:
     # Static mid-point PNG (fast sanity check):
     python rendering/render_3d_animation.py ... rendering/preview.png
 
-    # Full MP4 animation:
+    # Full animation:
     python rendering/render_3d_animation.py ... rendering/pathlines_3d.mp4
 
 All positional args are optional; see defaults below.
@@ -32,6 +32,8 @@ import os
 import argparse
 
 import numpy as np
+from datetime import datetime, timedelta
+import netCDF4 as nc_mod
 
 # ---------------------------------------------------------------------------
 # Tunable constants
@@ -50,20 +52,13 @@ OCEAN_DEPTH_CLIM   = 5000    # depth (m) at which ocean colour saturates to dark
 PARTICLE_DEPTH_CLIM = None   # depth (m) for particle colourmap upper bound;
                              # None = auto-compute from the 95th-percentile depth
 
-# After running --interactive, paste the printed camera position here so
-# the animation uses the same view without re-opening the window.
-# Example:  CAMERA_POSITION = [(x,y,z), (fx,fy,fz), (ux,uy,uz)]
-# South Pacific view: faces the ocean hemisphere where most particles originate.
-# lon ≈ -150° (central Pacific), lat ≈ -20° keeps the up vector stable.
+# CAMERA_POSITION = [(x,y,z), (fx,fy,fz), (ux,uy,uz)]
 # Pacific view: lon≈220°, equatorial, pulled back
 # CAMERA_POSITION = [(-22_000_000.0, -18_000_000.0, 3_000_000.0), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)]
 # Atlantic view: lon≈310° (50°W), shows mid-Atlantic + American east coast on right
 CAMERA_POSITION = [(18_000_000.0, -21_000_000.0, 2_000_000.0), (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)]
 
 EARTH_RADIUS = 6_371_229.0   # metres (MPAS-O reference)
-
-from datetime import datetime, timedelta
-
 
 def read_sim_time_info(nc_path, paraflow_yaml=None):
     """
@@ -75,7 +70,6 @@ def read_sim_time_info(nc_path, paraflow_yaml=None):
         dt (seconds) × record_interval  (from the ParaFlow yaml)
     e.g. dt=60 s, record_interval=60 → 1 hour per stored particle step.
     """
-    import netCDF4 as nc_mod
     with nc_mod.Dataset(nc_path) as ds:
         xtime_chars = ds.variables["xtime.orig"][0].data
         xtime_str   = b"".join(xtime_chars).decode().strip("\x00")
@@ -116,7 +110,6 @@ DEFAULT_PATHLINES = "pathlines/nersc_highres_256_cpu_10k/pathlines.bin"
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-
 def read_pathlines(path):
     """Read pathlines.bin → list of (pid, Nx3 float64 array)."""
     if not os.path.exists(path):
@@ -229,9 +222,39 @@ def build_ocean_globe(nc_path, depth_clim, earth_radius):
     v = ((lat_sph + 90.0) / 180.0).astype(np.float32)
     sphere.active_texture_coordinates = np.column_stack([u, v])
 
+    # Seam fix: triangles bridging u≈0 and u≈1 would otherwise interpolate UVs
+    # across the entire texture (visible blue streak at lon=0°).  For each such
+    # triangle, replace its low-U vertex with a duplicate whose U is shifted
+    # up by 1.0 — so interpolation goes from u≈0.997 → u≈1.001 (a tiny step).
+    faces      = sphere.faces.reshape(-1, 4).copy()
+    tri_u      = u[faces[:, 1:]]
+    seam_tris  = np.where((tri_u.max(axis=1) - tri_u.min(axis=1)) > 0.5)[0]
+    if seam_tris.size:
+        pts_list = list(sphere.points)
+        u_list   = list(u)
+        v_list   = list(v)
+        remap    = {}
+        for ti in seam_tris:
+            for ci in (1, 2, 3):
+                vi = int(faces[ti, ci])
+                if u[vi] < 0.5:
+                    if vi not in remap:
+                        remap[vi] = len(pts_list)
+                        pts_list.append(sphere.points[vi])
+                        u_list.append(u[vi] + 1.0)
+                        v_list.append(v[vi])
+                    faces[ti, ci] = remap[vi]
+        sphere.points = np.array(pts_list)
+        sphere.faces  = faces.ravel()
+        sphere.active_texture_coordinates = np.column_stack([u_list, v_list]).astype(np.float32)
+        print(f"  Seam fix: duplicated {len(remap)} vertices across {len(seam_tris)} triangles")
+
     # Pre-flip: PyVista._from_array internally flips the row axis, so we flip
     # first so the two flips cancel and V=0 correctly lands at the south pole.
     texture = pv.Texture(img[::-1])
+    # Enable U-direction tiling so duplicated vertices with u>1 sample the
+    # correct wrapped texel instead of clamping to the rightmost column.
+    texture.SetRepeat(True)
     return sphere, texture
 
 
@@ -443,27 +466,28 @@ def main():
     vis = visible_mask(t0_heads, cam_pos)
     print(f"  Visible particles (front hemisphere): {vis.sum():,} / {n_parts:,}")
 
-    fill_tail_buffer(tail_pts_buf, tail_depth_buf, pathlines, 0, TAIL_LEN, vis)
-    tail_mesh.points            = tail_pts_buf
-    tail_mesh["particle_depth"] = tail_depth_buf
-    plotter.add_mesh(tail_mesh, scalars="particle_depth", cmap="plasma_r",
-                     clim=[0, PARTICLE_DEPTH_CLIM],
-                     line_width=TAIL_LINE_WIDTH, lighting=False, show_scalar_bar=True,
-                     scalar_bar_args={"title": "Particle\nDepth (m)", "color": "white",
-                                      "fmt": "%.0f", "vertical": True,
-                                      "width": 0.035, "height": 0.22,
-                                      "position_x": 0.02, "position_y": 0.05})
+    if not (is_png and args.final):
+        fill_tail_buffer(tail_pts_buf, tail_depth_buf, pathlines, 0, TAIL_LEN, vis)
+        tail_mesh.points            = tail_pts_buf
+        tail_mesh["particle_depth"] = tail_depth_buf
+        plotter.add_mesh(tail_mesh, scalars="particle_depth", cmap="plasma_r",
+                         clim=[0, PARTICLE_DEPTH_CLIM],
+                         line_width=TAIL_LINE_WIDTH, lighting=False, show_scalar_bar=True,
+                         scalar_bar_args={"title": "Particle\nDepth (m)", "color": "white",
+                                          "fmt": "%.0f", "vertical": True,
+                                          "width": 0.035, "height": 0.22,
+                                          "position_x": 0.02, "position_y": 0.05})
 
-    # Particle heads
-    head_pts_buf   = np.zeros((n_parts, 3), dtype=np.float64)
-    head_depth_buf = np.zeros(n_parts, dtype=np.float32)
-    fill_head_buffer(head_pts_buf, head_depth_buf, pathlines, 0, vis)
-    head_mesh = pv.PolyData(head_pts_buf.copy())
-    head_mesh["particle_depth"] = head_depth_buf
-    plotter.add_mesh(head_mesh, scalars="particle_depth", cmap="plasma_r",
-                     clim=[0, PARTICLE_DEPTH_CLIM],
-                     point_size=HEAD_POINT_SIZE, render_points_as_spheres=True,
-                     lighting=False, show_scalar_bar=False)
+        # Particle heads
+        head_pts_buf   = np.zeros((n_parts, 3), dtype=np.float64)
+        head_depth_buf = np.zeros(n_parts, dtype=np.float32)
+        fill_head_buffer(head_pts_buf, head_depth_buf, pathlines, 0, vis)
+        head_mesh = pv.PolyData(head_pts_buf.copy())
+        head_mesh["particle_depth"] = head_depth_buf
+        plotter.add_mesh(head_mesh, scalars="particle_depth", cmap="plasma_r",
+                         clim=[0, PARTICLE_DEPTH_CLIM],
+                         point_size=HEAD_POINT_SIZE, render_points_as_spheres=True,
+                         lighting=False, show_scalar_bar=False)
 
     # --- Interactive mode ---
     if args.interactive:
@@ -477,15 +501,18 @@ def main():
 
     # --- Final summary image: all complete trajectories ---
     if is_png and args.final:
-        end_heads = np.array([coords[-1] for _, coords in pathlines])
+        sub_pathlines = pathlines[::5]
+        print(f"  --final subsample: 1-in-5 particles → {len(sub_pathlines)}/{len(pathlines)}")
+
+        end_heads = np.array([coords[-1] for _, coords in sub_pathlines])
         vis_final = visible_mask(end_heads, cam_pos)
-        print(f"  Visible particles at end: {vis_final.sum():,} / {n_parts:,}")
+        print(f"  Visible particles at end: {vis_final.sum():,} / {len(sub_pathlines):,}")
 
         # Build one PolyData with every particle's full path (front hemisphere only)
         all_pts, all_depths = [], []
         counts, offsets = [], []
         cumulative = 0
-        for k, (_, coords) in enumerate(pathlines):
+        for k, (_, coords) in enumerate(sub_pathlines):
             if not vis_final[k]:
                 continue
             depths = compute_depth(coords)
@@ -499,13 +526,6 @@ def main():
         pts_cat   = np.concatenate(all_pts,   axis=0).astype(np.float64)
         depth_cat = np.concatenate(all_depths, axis=0).astype(np.float32)
 
-        conn = np.hstack([
-            np.column_stack([
-                np.full(len(counts), 1, dtype=np.int32) * np.array(counts, dtype=np.int32),
-                # each row: [n, start, start+1, ..., start+n-1]
-            ])
-        ])
-        # Build connectivity the standard PyVista way
         lines_list = []
         for n, off in zip(counts, offsets):
             lines_list.append(n)
@@ -524,16 +544,6 @@ def main():
                                           "fmt": "%.0f", "vertical": True,
                                           "width": 0.035, "height": 0.22,
                                           "position_x": 0.02, "position_y": 0.05})
-
-        # Final endpoint heads
-        final_head_pts = pts_cat[np.array([off + n - 1 for n, off in zip(counts, offsets)])]
-        final_head_d   = depth_cat[np.array([off + n - 1 for n, off in zip(counts, offsets)])]
-        fhead_mesh = pv.PolyData(final_head_pts)
-        fhead_mesh["particle_depth"] = final_head_d
-        plotter.add_mesh(fhead_mesh, scalars="particle_depth", cmap="plasma_r",
-                         clim=[0, PARTICLE_DEPTH_CLIM],
-                         point_size=HEAD_POINT_SIZE, render_points_as_spheres=True,
-                         lighting=False, show_scalar_bar=False)
 
         end_label = fmt_mpas_time(sim_start, dt_minutes, max_npts - 1)
         plotter.add_text(f"All pathlines  {xtime_str} → {end_label}",
