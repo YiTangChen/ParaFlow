@@ -10,15 +10,15 @@
 // Per-block timing accumulators (stored in each Block instance). All times are in seconds.
 struct BlockTiming {
     // ── Initialization phase ──────────────────────────────────────────────────
-    double t_block_load         = 0.0;  // set_data total (= t_netcdf_read + t_seed_filter)
+    // (block-load total is derived at parse time as t_netcdf_read + t_seed_filter)
     double t_netcdf_read        = 0.0;  // LoadMPASOData: NetCDF I/O + mesh topology build
     double t_seed_filter        = 0.0;  // inBlock() scan over all broadcast seeds
 
     // ── Tracing phase (accumulated over all iexchange rounds) ─────────────────
     double t_trace_compute      = 0.0;  // GenStreamLines / GenPathLines (RK4 integration)
-    double t_trace_enqueue      = 0.0;  // Segment build + cp.enqueue() after each trace round
-    double t_trace_comm         = 0.0;  // deq_incoming_iexchange (receive particles)
-    double t_fill_incoming      = 0.0;  // cp.fill_incoming() wait — true network/idle time
+    double t_trace_enqueue      = 0.0;  // Segment build/packing + cp.enqueue()
+    double t_dequeue_local      = 0.0;  // deq_incoming_iexchange: local dequeue/receive work (no network)
+    double t_fill_incoming      = 0.0;  // cp.fill_incoming(): exposed wait/progress/completion
 
     // ── Output phase ─────────────────────────────────────────────────────────
     double t_output_write       = 0.0;  // write_trajectory
