@@ -37,12 +37,17 @@ Thumbs.db
 /block_outputs/
 /seeds/
 /results/
+/conf/
 
 # Generated figures
 *.png
 *.pdf
 *.log
 *.csv
+
+# Generated files
+*.bin
+slurm-*.out
 
 # Graph partition files
 *.info.part.*

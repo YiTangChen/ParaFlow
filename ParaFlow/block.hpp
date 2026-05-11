@@ -96,7 +96,6 @@ struct Block
         // ── Phase 2: Seed filtering — inBlock() scan over all broadcast seeds ─
         if (allseeds.empty()) {
             std::cerr << "[Block::set_data] warning: allseeds is empty, skip\n";
-            timing.t_block_load = timing.t_netcdf_read;
             return;
         }
 
@@ -134,9 +133,6 @@ struct Block
                           << seedCnt << "/" << allseeds.size() << " seeds" << std::endl;
         }
         pf_accum(timing.t_seed_filter, _t_filter, enable_timing);
-
-        // Keep t_block_load as the sum for backwards compatibility with parse_timing.py
-        timing.t_block_load = timing.t_netcdf_read + timing.t_seed_filter;
 
         this->setStartPtsDone();
     }

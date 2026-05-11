@@ -203,10 +203,12 @@ void ParaFlow::trace_block(Block*                               b,
     // Each iteration of this loop is one iexchange round.
     while (true)
     {
-        // ── Receive incoming particles from neighbours ────────────────────────
-        double _t_comm = pf_now(enable_timing);
+        // ── Dequeue incoming particles from neighbours ────────────────────────
+        // This is local dequeue/receive bookkeeping; network transfer already
+        // happened asynchronously inside DIY.
+        double _t_deq = pf_now(enable_timing);
         this->deq_incoming_iexchange(b, cp);
-        pf_accum(b->timing.t_trace_comm, _t_comm, enable_timing);
+        pf_accum(b->timing.t_dequeue_local, _t_deq, enable_timing);
 
         if (b->currentSeeds.size() > 0)
         {
@@ -222,7 +224,7 @@ void ParaFlow::trace_block(Block*                               b,
             if (enable_timing)
                 for (auto s : b->sl_stepcounts) b->timing.n_steps_total += s;
 
-            // ── Segment build + enqueue outgoing particles ────────────────────
+            // ── Pack segments + enqueue outgoing particles ────────────────────
             // Previously untimed: this loop copies trace coords into Segment
             // objects and calls cp.enqueue() for every particle that exits the
             // block.  For large seed counts the coord copies are non-trivial;
@@ -282,10 +284,10 @@ void ParaFlow::trace_block(Block*                               b,
 
         if (enable_timing) b->timing.n_iex_rounds++;
 
-        // ── Wait for more work (network / idle time) ──────────────────────────
-        // Previously untimed: fill_incoming() blocks until new particles arrive
-        // or all neighbours confirm they are done.  This is the dominant idle
-        // signal for load-imbalance analysis.
+        // ── Exposed wait/progress for more work ───────────────────────────────
+        // fill_incoming() can block until new particles arrive or all neighbours
+        // confirm completion.  In asynchronous DIY, communication may overlap
+        // with compute, so this measures only the exposed wait/progress cost.
         double _t_fill = pf_now(enable_timing);
         bool has_more = cp.fill_incoming();
         pf_accum(b->timing.t_fill_incoming, _t_fill, enable_timing);
@@ -321,7 +323,7 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         b->set_rank(rank);
         if (enable_timing) b->timing.mem_vmrss_before_kb = pf_read_vmrss_kb();
         // enable_timing is forwarded so set_data times t_netcdf_read and t_seed_filter
-        // internally; t_block_load is set as their sum inside set_data.
+        // internally; the load-phase total is derived at parse time.
         b->set_data(gid, this->meshFile.c_str(), this->vectorFiles[0].c_str(), this->seeds, this->areaIndices, this->cfg, this->enable_timing);
         if (enable_timing) {
             b->timing.n_seeds_initial      = (int)b->currentSeeds.size();
@@ -347,6 +349,7 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
     }
 
     double t_iexchange = 0.0;
+    double t_iexchange_barrier = 0.0;
     double _t_iex = pf_now(enable_timing);
     int ncalls = 0;
     master.iexchange([&](Block* b, const diy::Master::ProxyWithLink& icp) -> bool
@@ -355,8 +358,10 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         bool val = this->trace_block_iexchange(b, icp);
         return val;
     });
-    world.barrier();
     pf_accum(t_iexchange, _t_iex, enable_timing);
+    double _t_barrier = pf_now(enable_timing);
+    world.barrier();
+    pf_accum(t_iexchange_barrier, _t_barrier, enable_timing);
 
     // Write output — always runs; timing is gated inside
     for (size_t i = 0; i < gids.size(); ++i)   // for the local blocks in this processor
@@ -374,9 +379,9 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp) {
             b->timing.mem_peak_vmhwm_kb = pf_read_vmhwm_kb();
             fprintf(stderr,
-                "TIMING phase=block_load    rank=%d gid=%d t=%.6f nseeds=%d"
+                "TIMING phase=block_load    rank=%d gid=%d nseeds=%d"
                 " t_netcdf=%.6f t_filter=%.6f\n",
-                b->rank, cp.gid(), b->timing.t_block_load, b->timing.n_seeds_initial,
+                b->rank, cp.gid(), b->timing.n_seeds_initial,
                 b->timing.t_netcdf_read, b->timing.t_seed_filter);
             fprintf(stderr,
                 "TIMING phase=trace_compute rank=%d gid=%d t=%.6f nsteps=%ld"
@@ -385,8 +390,8 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
                 b->timing.n_steps_total, b->timing.n_particles_received,
                 b->timing.n_particles_sent, b->timing.n_iex_rounds);
             fprintf(stderr,
-                "TIMING phase=trace_comm    rank=%d gid=%d t=%.6f\n",
-                b->rank, cp.gid(), b->timing.t_trace_comm);
+                "TIMING phase=dequeue_local rank=%d gid=%d t=%.6f\n",
+                b->rank, cp.gid(), b->timing.t_dequeue_local);
             fprintf(stderr,
                 "TIMING phase=trace_enqueue rank=%d gid=%d t=%.6f\n",
                 b->rank, cp.gid(), b->timing.t_trace_enqueue);
@@ -410,15 +415,32 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
                 "MEM_PEAK       rank=%d gid=%d vmhwm_kb=%ld\n",
                 b->rank, cp.gid(), b->timing.mem_peak_vmhwm_kb);
         });
-        fprintf(stderr, "TIMING phase=iexchange_total rank=%d t=%.6f\n", rank, t_iexchange);
+        fprintf(stderr,
+                "TIMING phase=iexchange_total rank=%d t=%.6f t_barrier=%.6f t_with_barrier=%.6f\n",
+                rank, t_iexchange, t_iexchange_barrier,
+                t_iexchange + t_iexchange_barrier);
         double iex_min, iex_max, iex_sum;
+        double barrier_min, barrier_max, barrier_sum;
+        double with_barrier = t_iexchange + t_iexchange_barrier;
+        double with_barrier_min, with_barrier_max, with_barrier_sum;
         MPI_Reduce(&t_iexchange, &iex_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
         MPI_Reduce(&t_iexchange, &iex_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         MPI_Reduce(&t_iexchange, &iex_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_iexchange_barrier, &barrier_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_iexchange_barrier, &barrier_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_iexchange_barrier, &barrier_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&with_barrier, &with_barrier_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&with_barrier, &with_barrier_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&with_barrier, &with_barrier_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         if (rank == 0)
             fprintf(stderr,
-                "TIMING phase=iexchange_global iex_min=%.6f iex_max=%.6f iex_avg=%.6f iex_imbalance=%.3f\n",
+                "TIMING phase=iexchange_global iex_min=%.6f iex_max=%.6f iex_avg=%.6f"
+                " iex_barrier_min=%.6f iex_barrier_max=%.6f iex_barrier_avg=%.6f"
+                " iex_with_barrier_min=%.6f iex_with_barrier_max=%.6f iex_with_barrier_avg=%.6f"
+                " iex_imbalance=%.3f\n",
                 iex_min, iex_max, iex_sum / this->size,
+                barrier_min, barrier_max, barrier_sum / this->size,
+                with_barrier_min, with_barrier_max, with_barrier_sum / this->size,
                 (iex_min > 0.0) ? iex_max / iex_min : 0.0);
     }
 }
@@ -432,99 +454,109 @@ void ParaFlow::trace_block_pathline(Block*                              b,
 {
     diy::Link* l = cp.link();
 
-    do
+    while (true)
     {
-        double _t_comm = pf_now(enable_timing);
+        // Local dequeue/receive bookkeeping; network transfer already happened
+        // asynchronously inside DIY.
+        double _t_deq = pf_now(enable_timing);
         this->deq_incoming_iexchange(b, cp);
-        pf_accum(b->timing.t_trace_comm, _t_comm, enable_timing);
+        pf_accum(b->timing.t_dequeue_local, _t_deq, enable_timing);
 
-        if (b->currentSeeds.size() == 0)
-            continue;
-
-        // Build per-seed start times from PtInfo.ts (0.0 for initial seeds,
-        // non-zero for particles that were forwarded from a neighbour block).
-        std::vector<double> tarray(b->startPts.size());
-        for (size_t i = 0; i < b->startPts.size(); i++)
-            tarray[i] = b->startPts[i].ts;
-
-        // ── Advect particles through the time-varying field ──────────────────
-        int maxRemaining = 0;
-        for (auto& pt : b->startPts)
-            maxRemaining = std::max(maxRemaining, this->max_steps - pt.nsteps);
-
-        double _t_comp = pf_now(enable_timing);
-        b->GenPathLineByOSUFlow(maxRemaining, tarray.data(), this->interval);
-        pf_accum(b->timing.t_trace_compute, _t_comp, enable_timing);
-        if (enable_timing)
-            for (auto s : b->pl_stepcounts) b->timing.n_steps_total += s;
-
-        int sent = 0;
-        int seedCnt = 0;
-        double maxT = b->getWindowMaxTime();
-        for (auto pl = b->pl_list.begin(); pl != b->pl_list.end(); pl++, seedCnt++)
+        if (b->currentSeeds.size() > 0)
         {
-            vtListTimeSeedTrace* trace = *pl;
+            // Build per-seed start times from PtInfo.ts (0.0 for initial seeds,
+            // non-zero for particles that were forwarded from a neighbour block).
+            std::vector<double> tarray(b->startPts.size());
+            for (size_t i = 0; i < b->startPts.size(); i++)
+                tarray[i] = b->startPts[i].ts;
 
-            Segment currseg;
-            currseg.gid    = b->startPts[seedCnt].gid;
-            currseg.pid    = b->startPts[seedCnt].pid;
-            currseg.sid    = b->startPts[seedCnt].sid;
-            currseg.nsteps = b->startPts[seedCnt].nsteps;
+            // ── Advect particles through the time-varying field ──────────────
+            int maxRemaining = 0;
+            for (auto& pt : b->startPts)
+                maxRemaining = std::max(maxRemaining, this->max_steps - pt.nsteps);
 
-            // Each VECTOR4 entry: [x, y, z, t]; collect already-downsampled coords
-            double exitTime = tarray[seedCnt];
-            for (auto pIt = trace->begin(); pIt != trace->end(); pIt++)
+            double _t_comp = pf_now(enable_timing);
+            b->GenPathLineByOSUFlow(maxRemaining, tarray.data(), this->interval);
+            pf_accum(b->timing.t_trace_compute, _t_comp, enable_timing);
+            if (enable_timing)
+                for (auto s : b->pl_stepcounts) b->timing.n_steps_total += s;
+
+            double _t_enq = pf_now(enable_timing);
+            int sent = 0;
+            int seedCnt = 0;
+            double maxT = b->getWindowMaxTime();
+            for (auto pl = b->pl_list.begin(); pl != b->pl_list.end(); pl++, seedCnt++)
             {
-                VECTOR3 tmp;
-                for (int i = 0; i < 3; i++)
-                    tmp[i] = (**pIt)[i];
-                currseg.coords.push_back(tmp);
-                exitTime = (**pIt)[3];  // time of last stored point
-            }
-            // Use actual step count reported by OSUFlow (interval-aware)
-            if (seedCnt < (int)b->pl_stepcounts.size())
-                currseg.nsteps += b->pl_stepcounts[seedCnt];
+                vtListTimeSeedTrace* trace = *pl;
 
-            if (currseg.coords.empty())
-                continue;
+                Segment currseg;
+                currseg.gid    = b->startPts[seedCnt].gid;
+                currseg.pid    = b->startPts[seedCnt].pid;
+                currseg.sid    = b->startPts[seedCnt].sid;
+                currseg.nsteps = b->startPts[seedCnt].nsteps;
 
-            bool finished = (currseg.nsteps >= this->max_steps);
-
-            int toCell         = (seedCnt < (int)b->toCells.size()) ? b->toCells[seedCnt] : -1;
-            int nextNeighborId = b->GetNeighborId(toCell);
-            bool isTemporal    = (!finished && nextNeighborId < 0 && exitTime >= maxT - b->integrationDt);
-
-            b->segs.push_back(currseg);
-
-            if (!finished)
-            {
-                PtInfo endPt;
-                for (int i = 0; i < 3; i++)
-                    endPt.coord[i] = currseg.coords.back()[i];
-                endPt.gid      = currseg.gid;
-                endPt.pid      = currseg.pid;
-                endPt.sid      = currseg.sid + 1;
-                endPt.nsteps   = currseg.nsteps;
-                endPt.ts = exitTime;
-
-                if (isTemporal)
+                // Each VECTOR4 entry: [x, y, z, t]; collect already-downsampled coords.
+                double exitTime = tarray[seedCnt];
+                for (auto pIt = trace->begin(); pIt != trace->end(); pIt++)
                 {
-                    endPt.fromCell = (toCell >= 0) ? b->GetGlobalCellidx(toCell) : -1;
-                    b->temporalBoundaryPts.push_back(endPt);
+                    VECTOR3 tmp;
+                    for (int i = 0; i < 3; i++)
+                        tmp[i] = (**pIt)[i];
+                    currseg.coords.push_back(tmp);
+                    exitTime = (**pIt)[3];  // time of last stored point
                 }
-                else if (nextNeighborId >= 0)
+                if (seedCnt < (int)b->pl_stepcounts.size())
+                    currseg.nsteps += b->pl_stepcounts[seedCnt];
+
+                if (currseg.coords.empty())
+                    continue;
+
+                bool finished = (currseg.nsteps >= this->max_steps);
+
+                int toCell         = (seedCnt < (int)b->toCells.size()) ? b->toCells[seedCnt] : -1;
+                int nextNeighborId = b->GetNeighborId(toCell);
+                bool isTemporal    = (!finished && nextNeighborId < 0 && exitTime >= maxT - b->integrationDt);
+
+                b->segs.push_back(currseg);
+
+                if (!finished)
                 {
-                    endPt.fromCell  = b->GetGlobalCellidx(toCell);
-                    diy::BlockID bid = l->target(nextNeighborId);
-                    cp.enqueue(bid, endPt);
-                    sent++;
+                    PtInfo endPt;
+                    for (int i = 0; i < 3; i++)
+                        endPt.coord[i] = currseg.coords.back()[i];
+                    endPt.gid      = currseg.gid;
+                    endPt.pid      = currseg.pid;
+                    endPt.sid      = currseg.sid + 1;
+                    endPt.nsteps   = currseg.nsteps;
+                    endPt.ts = exitTime;
+
+                    if (isTemporal)
+                    {
+                        endPt.fromCell = (toCell >= 0) ? b->GetGlobalCellidx(toCell) : -1;
+                        b->temporalBoundaryPts.push_back(endPt);
+                    }
+                    else if (nextNeighborId >= 0)
+                    {
+                        endPt.fromCell  = b->GetGlobalCellidx(toCell);
+                        diy::BlockID bid = l->target(nextNeighborId);
+                        cp.enqueue(bid, endPt);
+                        sent++;
+                    }
                 }
             }
+
+            b->endTracing();
+            pf_accum(b->timing.t_trace_enqueue, _t_enq, enable_timing);
+            if (enable_timing) b->timing.n_particles_sent += sent;
         }
 
-        int temporal = (int)b->temporalBoundaryPts.size();
-        b->endTracing();
-    } while (cp.fill_incoming());
+        if (enable_timing) b->timing.n_iex_rounds++;
+
+        double _t_fill = pf_now(enable_timing);
+        bool has_more = cp.fill_incoming();
+        pf_accum(b->timing.t_fill_incoming, _t_fill, enable_timing);
+        if (!has_more) break;
+    }
 }
 
 bool ParaFlow::trace_block_pathline_iexchange(Block*                              b,
@@ -554,10 +586,8 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
         diy::Link* link = new diy::Link;
         b->set_rank(rank);
         if (enable_timing) b->timing.mem_vmrss_before_kb = pf_read_vmrss_kb();
-        double _t_load = pf_now(enable_timing);
         b->set_data(gid, this->meshFile.c_str(), this->vectorFiles[0].c_str(),
-                    this->seeds, this->areaIndices, this->cfg);
-        pf_accum(b->timing.t_block_load, _t_load, enable_timing);
+                    this->seeds, this->areaIndices, this->cfg, this->enable_timing);
         if (enable_timing) {
             b->timing.n_seeds_initial      = (int)b->currentSeeds.size();
             b->timing.mem_vmrss_after_kb   = pf_read_vmrss_kb();
@@ -583,20 +613,27 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
         totalTimestepsInFile = ((Block*)master.block(master.lid(gids[0])))->getTotalTimesteps();
     diy::mpi::broadcast(world, totalTimestepsInFile, 0);
 
-    double t_iexchange = 0.0;   // accumulated across all temporal windows
+    double t_iexchange = 0.0;           // accumulated across all temporal windows
+    double t_iexchange_barrier = 0.0;   // barrier wait after each temporal window
     int windowIdx = 0;
     while (true) {
         double _t_iex = pf_now(enable_timing);
         master.iexchange([&](Block* b, const diy::Master::ProxyWithLink& icp) -> bool {
             return this->trace_block_pathline_iexchange(b, icp);
         });
-        world.barrier();
         double t_window = 0.0;
         pf_accum(t_window, _t_iex, enable_timing);
         t_iexchange += t_window;
+        double _t_barrier = pf_now(enable_timing);
+        world.barrier();
+        double t_window_barrier = 0.0;
+        pf_accum(t_window_barrier, _t_barrier, enable_timing);
+        t_iexchange_barrier += t_window_barrier;
         if (enable_timing)
-            fprintf(stderr, "TIMING phase=window_iexchange rank=%d window=%d t=%.6f\n",
-                    rank, windowIdx, t_window);
+            fprintf(stderr,
+                    "TIMING phase=window_iexchange rank=%d window=%d t=%.6f t_barrier=%.6f t_with_barrier=%.6f\n",
+                    rank, windowIdx, t_window, t_window_barrier,
+                    t_window + t_window_barrier);
         windowIdx++;
 
         // Use the reader's actual global offset to determine if more data exists.
@@ -637,9 +674,9 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp) {
             b->timing.mem_peak_vmhwm_kb = pf_read_vmhwm_kb();
             fprintf(stderr,
-                "TIMING phase=block_load    rank=%d gid=%d t=%.6f nseeds=%d"
+                "TIMING phase=block_load    rank=%d gid=%d nseeds=%d"
                 " t_netcdf=%.6f t_filter=%.6f\n",
-                b->rank, cp.gid(), b->timing.t_block_load, b->timing.n_seeds_initial,
+                b->rank, cp.gid(), b->timing.n_seeds_initial,
                 b->timing.t_netcdf_read, b->timing.t_seed_filter);
             fprintf(stderr,
                 "TIMING phase=trace_compute rank=%d gid=%d t=%.6f nsteps=%ld"
@@ -648,8 +685,8 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
                 b->timing.n_steps_total, b->timing.n_particles_received,
                 b->timing.n_particles_sent, b->timing.n_iex_rounds);
             fprintf(stderr,
-                "TIMING phase=trace_comm    rank=%d gid=%d t=%.6f\n",
-                b->rank, cp.gid(), b->timing.t_trace_comm);
+                "TIMING phase=dequeue_local rank=%d gid=%d t=%.6f\n",
+                b->rank, cp.gid(), b->timing.t_dequeue_local);
             fprintf(stderr,
                 "TIMING phase=trace_enqueue rank=%d gid=%d t=%.6f\n",
                 b->rank, cp.gid(), b->timing.t_trace_enqueue);
@@ -673,15 +710,32 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
                 "MEM_PEAK       rank=%d gid=%d vmhwm_kb=%ld\n",
                 b->rank, cp.gid(), b->timing.mem_peak_vmhwm_kb);
         });
-        fprintf(stderr, "TIMING phase=iexchange_total rank=%d t=%.6f\n", rank, t_iexchange);
+        fprintf(stderr,
+                "TIMING phase=iexchange_total rank=%d t=%.6f t_barrier=%.6f t_with_barrier=%.6f\n",
+                rank, t_iexchange, t_iexchange_barrier,
+                t_iexchange + t_iexchange_barrier);
         double iex_min, iex_max, iex_sum;
+        double barrier_min, barrier_max, barrier_sum;
+        double with_barrier = t_iexchange + t_iexchange_barrier;
+        double with_barrier_min, with_barrier_max, with_barrier_sum;
         MPI_Reduce(&t_iexchange, &iex_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
         MPI_Reduce(&t_iexchange, &iex_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         MPI_Reduce(&t_iexchange, &iex_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_iexchange_barrier, &barrier_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_iexchange_barrier, &barrier_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_iexchange_barrier, &barrier_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&with_barrier, &with_barrier_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&with_barrier, &with_barrier_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&with_barrier, &with_barrier_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         if (rank == 0)
             fprintf(stderr,
-                "TIMING phase=iexchange_global iex_min=%.6f iex_max=%.6f iex_avg=%.6f iex_imbalance=%.3f\n",
+                "TIMING phase=iexchange_global iex_min=%.6f iex_max=%.6f iex_avg=%.6f"
+                " iex_barrier_min=%.6f iex_barrier_max=%.6f iex_barrier_avg=%.6f"
+                " iex_with_barrier_min=%.6f iex_with_barrier_max=%.6f iex_with_barrier_avg=%.6f"
+                " iex_imbalance=%.3f\n",
                 iex_min, iex_max, iex_sum / this->size,
+                barrier_min, barrier_max, barrier_sum / this->size,
+                with_barrier_min, with_barrier_max, with_barrier_sum / this->size,
                 (iex_min > 0.0) ? iex_max / iex_min : 0.0);
     }
 }

@@ -4,7 +4,7 @@ Plot ParaFlow timing and memory results from CSV files.
 Outputs: results/plots/*.png
 
 Section A — single-run diagnostics (one (n_blocks, n_seeds) config):
-  A1  Compute vs Idle per block          — where time goes per rank
+  A1  Compute vs Exposed Wait per block  — where observed time goes per block
   A2  Load imbalance sorted              — which ranks are hot and by how much
   A3  RK4 steps per block                — explains WHY imbalance exists
   A4  Phase Gantt (approximate timeline) — visual timeline per rank
@@ -13,11 +13,11 @@ Section B — scaling analysis (varies n_blocks):
   B1  Strong scaling wall-clock time     — overall runtime vs ideal
   B2  Parallel efficiency                — quantifies scaling quality
   B3  Load imbalance ratio vs scale      — imbalance grows with P
-  B4  Phase breakdown vs scale           — compute / blockload / write / IDLE
+  B4  Iexchange breakdown vs scale       — compute / local message work / exposed wait
   B5  Memory per block vs scale          — data memory ∝ 1/n (positive result)
   B6  Speedup curve S(P)                 — T_base / T(P) vs ideal
-  B7  Compute vs wall-clock speedup      — gap = idle overhead (key finding)
-  B8  Idle fraction vs scale             — smoking gun: idle% grows with P
+  B7  Compute vs wall-clock speedup      — gap = exposed async overhead
+  B8  Exposed wait fraction vs scale     — unhidden wait/progress grows with P
 """
 
 import sys
@@ -39,7 +39,7 @@ SUMMARY_CSV = RESULTS_DIR / "run_summary.csv"
 BLOCK_CSV   = RESULTS_DIR / "block_detail.csv"
 
 # Colors — consistent across all plots.
-# Idle is orange-red: it is wasted time and should visually stand out.
+# Exposed wait is orange-red: it is time not hidden by asynchronous overlap.
 C_COMPUTE = "#2196F3"   # blue
 C_IDLE    = "#FF5722"   # deep orange — wasted time, make it visible
 C_LOAD    = "#4CAF50"   # green
@@ -62,20 +62,52 @@ def save(fig, name):
 summary = pd.read_csv(SUMMARY_CSV)
 blocks  = pd.read_csv(BLOCK_CSV)
 
-# Derive implicit idle time in summary.
-# Idle = wall time − all explicit phases.
-# t_comm_avg (~30 µs) is kept in the subtraction for correctness but is negligible.
-summary["t_idle_avg"] = (
-    summary["t_iex_avg"]
-    - summary["t_blockload_avg"]
-    - summary["t_compute_avg"]
-    - summary["t_comm_avg"]
-    - summary["t_write_avg"]
-).clip(lower=0)
+for col in ("t_enqueue_avg", "t_dequeue_local_avg", "t_fill_incoming_avg",
+            "t_iex_barrier_avg", "t_residual_avg"):
+    if col not in summary:
+        summary[col] = 0.0
+# Accept legacy column name `t_comm_avg` from CSVs produced before the
+# t_trace_comm → t_dequeue_local rename.
+if "t_comm_avg" in summary and (summary["t_dequeue_local_avg"] == 0).all():
+    summary["t_dequeue_local_avg"] = summary["t_comm_avg"]
+for col in ("t_trace_enqueue", "t_dequeue_local", "t_fill_incoming",
+            "t_trace_idle"):
+    if col not in blocks:
+        blocks[col] = 0.0
+if "t_trace_comm" in blocks and (blocks["t_dequeue_local"] == 0).all():
+    blocks["t_dequeue_local"] = blocks["t_trace_comm"]
+
+# Backward-compatible derived columns.  DIY iexchange is asynchronous, so these
+# are exposed-time categories, not a full physical network-transfer timeline.
+# Iexchange timing excludes block load, output write, and post-iexchange barrier.
+if "t_iex_with_barrier_avg" not in summary:
+    summary["t_iex_with_barrier_avg"] = summary["t_iex_avg"] + summary["t_iex_barrier_avg"]
+if "t_msg_overhead_avg" not in summary:
+    summary["t_msg_overhead_avg"] = summary["t_enqueue_avg"] + summary["t_dequeue_local_avg"]
+if "t_wait_sync_avg" not in summary:
+    summary["t_wait_sync_avg"] = summary["t_fill_incoming_avg"]
+if (summary["t_residual_avg"] == 0).all():
+    summary["t_residual_avg"] = (
+        summary["t_iex_avg"]
+        - summary["t_compute_avg"]
+        - summary["t_enqueue_avg"]
+        - summary["t_dequeue_local_avg"]
+        - summary["t_fill_incoming_avg"]
+    ).clip(lower=0)
+
+summary["t_idle_avg"] = summary["t_wait_sync_avg"] + summary["t_residual_avg"]
 
 summary["idle_fraction"] = (
     summary["t_idle_avg"] / summary["t_iex_avg"].replace(0, np.nan)
 )
+
+if "t_msg_overhead" not in blocks:
+    blocks["t_msg_overhead"] = blocks["t_trace_enqueue"] + blocks["t_dequeue_local"]
+if "t_wait_sync" not in blocks:
+    blocks["t_wait_sync"] = blocks["t_fill_incoming"]
+if (blocks["t_wait_sync"] == 0).all() and (blocks["t_trace_idle"] > 0).any():
+    # Old CSVs used t_trace_idle for all unaccounted/exposed overhead.
+    blocks["t_wait_sync"] = blocks["t_trace_idle"]
 
 # Keep only runs with actual data (t_iex_avg > 0)
 valid = summary[summary["t_iex_avg"] > 0].copy()
@@ -97,14 +129,17 @@ def plot_per_run(df_blocks, n_blocks, n_seeds, run_id):
     n     = len(df)
     w     = max(8, n * 0.55 + 2)   # figure width scales with number of blocks
 
-    # ── A1: Compute vs Idle per block ─────────────────────────────────────────
-    # Purpose: for one run, show where each rank's time goes.
-    # Compute = useful work.  Idle = waiting for the slowest peer (wasted).
+    # ── A1: Compute vs exposed wait/progress per block ────────────────────────
+    # Compute = useful work.  Exposed wait/progress is mostly fill_incoming().
     fig, ax = plt.subplots(figsize=(w, 4))
     ax.bar(x, df.t_trace_compute, label="Compute (RK4 integration)", color=C_COMPUTE, zorder=3)
-    ax.bar(x, df.t_trace_idle,
+    ax.bar(x, df.t_wait_sync,
            bottom=df.t_trace_compute,
-           label="Idle (waiting for slowest rank)", color=C_IDLE, alpha=0.88, zorder=3)
+           label="Exposed wait/progress", color=C_IDLE, alpha=0.88, zorder=3)
+    residual_bottom = df.t_trace_compute + df.t_wait_sync
+    ax.bar(x, df.t_trace_idle,
+           bottom=residual_bottom,
+           label="Residual uninstrumented", color="#795548", alpha=0.70, zorder=3)
 
     hot_idx = df.t_trace_compute.idxmax()
     hot     = df.loc[hot_idx]
@@ -117,11 +152,11 @@ def plot_per_run(df_blocks, n_blocks, n_seeds, run_id):
     )
     ax.set_xlabel("Block gid")
     ax.set_ylabel("Time (s)")
-    ax.set_title(f"Compute vs Idle per Block — {title}")
+    ax.set_title(f"Compute vs Exposed Wait per Block — {title}")
     ax.legend(loc="upper right")
     ax.set_xticks(x)
     ax.grid(axis="y", alpha=0.3, zorder=0)
-    save(fig, f"{tag}_A1_compute_vs_idle.png")
+    save(fig, f"{tag}_A1_compute_vs_wait.png")
 
     # ── A2: Load imbalance — sorted by compute time ───────────────────────────
     # Purpose: quantify how unequal the workload distribution is.
@@ -175,12 +210,13 @@ def plot_per_run(df_blocks, n_blocks, n_seeds, run_id):
     # ── A4: Phase Gantt — approximate timeline per rank ───────────────────────
     # Purpose: visually show that ranks finish at different times.
     # Phases stacked sequentially as approximation (no absolute timestamps).
-    # t_comm (~30 µs) omitted — physically and visually negligible.
     phases = [
         ("t_block_load",    "Block load",  C_LOAD),
         ("t_trace_compute", "Compute",     C_COMPUTE),
+        ("t_msg_overhead",  "Local message work", "#607D8B"),
+        ("t_wait_sync",     "Exposed wait/progress", C_IDLE),
+        ("t_trace_idle",    "Residual",    "#795548"),
         ("t_output_write",  "Write",       C_WRITE),
-        ("t_trace_idle",    "Idle",        C_IDLE),
     ]
     fig, ax = plt.subplots(figsize=(10, max(4, n * 0.30 + 1.5)))
     for _, row in df.iterrows():
@@ -295,12 +331,9 @@ def plot_scaling(valid):
     ax.grid(True, alpha=0.3)
     save(fig, "B3_load_imbalance_vs_scale.png")
 
-    # ── B4: Phase breakdown vs scale (stacked bar) ────────────────────────────
-    # Shows how the composition of wall time changes as P increases.
-    # IMPORTANT: t_comm (~30 µs) is omitted — it is ~10^8× smaller than compute
-    #            and would be invisible on any reasonable axis.
-    # Idle is DERIVED: wall − compute − blockload − write.  It is the dominant
-    # overhead at high block counts (up to 72% of wall time at P=128).
+    # ── B4: Iexchange exposed-time breakdown vs scale ─────────────────────────
+    # Because DIY communication is asynchronous, hidden network transfer may
+    # overlap with compute.  This plot shows exposed local work and waits only.
     for i, ns in enumerate(seed_counts):
         df = valid[valid.n_seeds == ns].sort_values("n_blocks")
         if len(df) < 2:
@@ -310,25 +343,25 @@ def plot_scaling(valid):
         labels = [str(int(n)) for n in df.n_blocks]
 
         b0 = np.zeros(len(df))
-        ax.bar(xpos, df.t_blockload_avg.values, bottom=b0,
-               label="Block load",  color=C_LOAD)
-        b1 = b0 + df.t_blockload_avg.values
-        ax.bar(xpos, df.t_compute_avg.values,   bottom=b1,
+        ax.bar(xpos, df.t_compute_avg.values,   bottom=b0,
                label="Compute",     color=C_COMPUTE)
-        b2 = b1 + df.t_compute_avg.values
-        ax.bar(xpos, df.t_write_avg.values,     bottom=b2,
-               label="Write",       color=C_WRITE)
-        b3 = b2 + df.t_write_avg.values
-        ax.bar(xpos, df.t_idle_avg.values,      bottom=b3,
-               label="Idle (imbalance overhead)", color=C_IDLE, alpha=0.88)
+        b1 = b0 + df.t_compute_avg.values
+        ax.bar(xpos, df.t_msg_overhead_avg.values, bottom=b1,
+               label="Local message work", color="#607D8B")
+        b2 = b1 + df.t_msg_overhead_avg.values
+        ax.bar(xpos, df.t_wait_sync_avg.values, bottom=b2,
+               label="Exposed wait/progress", color=C_IDLE, alpha=0.88)
+        b3 = b2 + df.t_wait_sync_avg.values
+        ax.bar(xpos, df.t_residual_avg.values,  bottom=b3,
+               label="Residual uninstrumented", color="#795548", alpha=0.70)
 
         ax.set_xticks(xpos)
         ax.set_xticklabels(labels)
         ax.set_xlabel("Number of blocks (MPI ranks)")
         ax.set_ylabel("Avg time per rank (s)")
         ax.set_title(
-            f"Phase Breakdown vs Scale — {ns:,} seeds\n"
-            f"(idle = wall − compute − I/O)"
+            f"Iexchange Exposed-Time Breakdown — {ns:,} seeds\n"
+            f"(asynchronous transfer may overlap with compute)"
         )
         ax.legend(loc="upper right", fontsize=8)
         ax.grid(axis="y", alpha=0.3, zorder=0)
@@ -401,15 +434,15 @@ def plot_scaling(valid):
     # ── B7: Compute-only vs wall-clock speedup (one plot per seed count) ────────
     # This is the KEY finding plot.
     # Compute speedup ≈ ideal → the algorithm itself scales perfectly.
-    # Wall-clock speedup << ideal → load imbalance / idle time is the bottleneck.
-    # The shaded gap between the two lines IS the wasted time.
+    # Wall-clock speedup << ideal → exposed async overhead is the bottleneck.
+    # The shaded gap between the two lines is non-compute overhead.
     #
     # Generated per seed count so each has its own baseline (critical for 100k
     # seeds which only has data from n=32 onward — a shared baseline would mix
     # incompatible reference points).
     #
     # Additional insight across plots: larger problems show a smaller gap because
-    # each rank has more compute work relative to the fixed idle overhead.
+    # each rank has more compute work to hide exchange/progress overhead.
     for i, ns in enumerate(seed_counts):
         df = valid[(valid.n_seeds == ns) & (valid.t_compute_avg > 0)].sort_values("n_blocks")
         if len(df) < 2:
@@ -428,7 +461,7 @@ def plot_scaling(valid):
         ax.plot(df.n_blocks, sp_wall, "s-", color=C_IDLE,    linewidth=2,
                 label="Wall-clock speedup")
         ax.fill_between(df.n_blocks, sp_wall, sp_comp,
-                        alpha=0.18, color=C_IDLE, label="Gap = idle overhead")
+                        alpha=0.18, color=C_IDLE, label="Gap = exposed overhead")
 
         ax.set_xscale("log", base=2)
         ax.set_yscale("log", base=2)
@@ -439,7 +472,7 @@ def plot_scaling(valid):
         ax.set_ylabel("Speedup")
         ax.set_title(
             f"Compute vs Wall-Clock Speedup — {ns:,} seeds  (baseline = {p0} blocks)\n"
-            f"(gap = time lost to load imbalance)"
+            f"(gap = exposed wait/progress and residual overhead)"
         )
         ax.legend()
         ax.grid(True, alpha=0.3, which="both")
@@ -448,17 +481,16 @@ def plot_scaling(valid):
               f"gap={sp_comp[-1]-sp_wall[-1]:.1f}×")
         save(fig, f"B7_compute_vs_total_speedup_s{ns:07d}.png")
 
-    # ── B8: Idle fraction vs scale ────────────────────────────────────────────
-    # The 'smoking gun' plot.
-    # Shows that the fraction of wall time spent idle grows rapidly with P.
+    # ── B8: Exposed wait fraction vs scale ────────────────────────────────────
+    # Shows the fraction of pure iexchange time not hidden by async overlap.
     # Directly links B3 (imbalance) to B2 (efficiency loss).
     fig, ax = plt.subplots(figsize=(7, 5))
     for i, ns in enumerate(seed_counts):
         df = valid[valid.n_seeds == ns].sort_values("n_blocks")
         if len(df) < 2:
             continue
-        idle_pct = df.idle_fraction * 100
-        ax.plot(df.n_blocks, idle_pct, "o-", color=sc[i], label=f"{ns:,} seeds")
+        wait_pct = df.idle_fraction * 100
+        ax.plot(df.n_blocks, wait_pct, "o-", color=sc[i], label=f"{ns:,} seeds")
         last = df.iloc[-1]
         ax.annotate(
             f"{last.idle_fraction * 100:.0f}%",
@@ -471,12 +503,12 @@ def plot_scaling(valid):
     ax.set_xticks(block_counts)
     ax.set_ylim(0, 105)
     ax.set_xlabel("Number of blocks (MPI ranks)")
-    ax.set_ylabel("Idle fraction (% of wall time)")
-    ax.set_title("Idle Time Fraction vs Scale\n"
-                 "(% of wall time where ranks wait for the slowest peer)")
+    ax.set_ylabel("Exposed overhead fraction (% of pure iexchange)")
+    ax.set_title("Exposed Wait/Progress Fraction vs Scale\n"
+                 "(fill_incoming + residual; barrier reported separately)")
     ax.legend()
     ax.grid(True, alpha=0.3)
-    save(fig, "B8_idle_fraction.png")
+    save(fig, "B8_wait_fraction.png")
 
 
 # ── run ────────────────────────────────────────────────────────────────────────
