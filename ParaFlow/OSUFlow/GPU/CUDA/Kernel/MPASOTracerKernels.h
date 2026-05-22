@@ -30,7 +30,11 @@ void LaunchTracer(const MPASODeviceField& field,
                   int               save_interval = 1,
                   int               max_saved_points = 0,
                   int*              h_saved_counts_out = nullptr,
-                  float*            kernel_ms_out = nullptr);  // CUDA Event kernel time (ms), accumulated
+                  float*            kernel_ms_out = nullptr,  // CUDA Event kernel time (ms), accumulated
+                  float*            alloc_ms_out = nullptr,
+                  float*            upload_particles_ms_out = nullptr,
+                  float*            download_results_ms_out = nullptr,
+                  float*            free_ms_out = nullptr);
 
 // Pathline launcher. Velocity is blended between two timesteps of the uploaded
 // window based on each particle's current time. Each particle starts at its
@@ -58,7 +62,11 @@ void LaunchPathlineTracer(const MPASODeviceField& field,
                           int               save_interval = 1,
                           int               max_saved_points = 0,
                           int*              h_saved_counts_out = nullptr,
-                          float*            kernel_ms_out = nullptr);  // CUDA Event kernel time (ms)
+                          float*            kernel_ms_out = nullptr,  // CUDA Event kernel time (ms)
+                          float*            alloc_ms_out = nullptr,
+                          float*            upload_particles_ms_out = nullptr,
+                          float*            download_results_ms_out = nullptr,
+                          float*            free_ms_out = nullptr);
 } // namespace mpaso_gpu
 
 #endif // MPASO_TRACER_KERNELS_H

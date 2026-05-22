@@ -6,6 +6,7 @@
 #include "Kernel/MPASOTracerKernels.h"
 
 #include <cuda_runtime.h>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -18,6 +19,18 @@ static_assert(sizeof(VECTOR3) == sizeof(mpaso_vec3),
               "VECTOR3 and mpaso_vec3 must be bit-compatible for reinterpret_cast");
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+inline Clock::time_point gpu_timer_now()
+{
+    return Clock::now();
+}
+
+inline float gpu_timer_ms_since(Clock::time_point start)
+{
+    return std::chrono::duration<float, std::milli>(Clock::now() - start).count();
+}
 
 // Pack Solution's jagged [ts][node] layout into a single flat [ts * node]
 // buffer of mpaso_vec3 that uploadVelocityWindow expects.
@@ -68,10 +81,17 @@ void TraceParticles(MPASOGrid*      grid,
                     int             save_interval,
                     int             max_saved_points,
                     int*            saved_counts_out,
-                    float*          kernel_ms_out)
+                    float*          kernel_ms_out,
+                    GPUTimingBreakdown* timing_out)
 {
     if (grid == nullptr || pSolution == nullptr || vSolution == nullptr) return;
     if (n_particles <= 0 || n_steps <= 0) return;
+
+    const bool collect_timing = (timing_out != nullptr) || (kernel_ms_out != nullptr);
+    GPUTimingBreakdown local_timing;
+    GPUTimingBreakdown* timing = collect_timing ? (timing_out ? timing_out : &local_timing) : nullptr;
+    auto t_pipeline = collect_timing ? gpu_timer_now() : Clock::time_point{};
+    auto t_host_prepare = collect_timing ? gpu_timer_now() : Clock::time_point{};
 
     MPASODeviceField field;
     field.n_cells            = grid->getNumCell();
@@ -83,6 +103,8 @@ void TraceParticles(MPASOGrid*      grid,
     field.earth_radius       = grid->getEarthRadius();
 
     // ---- topology upload (one-shot) ----
+    if (timing) timing->host_prepare_ms += gpu_timer_ms_since(t_host_prepare);
+    auto t_upload_topology = collect_timing ? gpu_timer_now() : Clock::time_point{};
     field.uploadTopology(
         reinterpret_cast<const mpaso_vec3*>(grid->getCellCoord()),
         reinterpret_cast<const mpaso_vec3*>(grid->getVertexCoord()),
@@ -90,8 +112,10 @@ void TraceParticles(MPASOGrid*      grid,
         grid->getCellsOnCell(),
         grid->getNumVerticesOnCell(),
         grid->getMaxLevelCell());
+    if (timing) timing->upload_topology_ms += gpu_timer_ms_since(t_upload_topology);
 
     // ---- velocity / ztop window upload ----
+    if (collect_timing) t_host_prepare = gpu_timer_now();
     const int n_vert_nodes = field.n_local_vertices * field.n_vert_levels;
     const int n_ts         = field.n_timesteps_loaded;
 
@@ -106,9 +130,13 @@ void TraceParticles(MPASOGrid*      grid,
     // ignores t_rel anyway.
     std::vector<double> h_timestamps(n_ts, 0.0);
 
+    if (timing) timing->host_prepare_ms += gpu_timer_ms_since(t_host_prepare);
+    auto t_upload_velocity = collect_timing ? gpu_timer_now() : Clock::time_point{};
     field.uploadVelocityWindow(h_vel.data(), h_vvel.data(), h_ztop, h_timestamps.data());
+    if (timing) timing->upload_velocity_ms += gpu_timer_ms_since(t_upload_velocity);
 
     // ---- launch ----
+    float kernel_ms = 0.0f;
     mpaso_gpu::LaunchTracer(
         field,
         reinterpret_cast<const mpaso_vec3*>(seeds),
@@ -126,9 +154,20 @@ void TraceParticles(MPASOGrid*      grid,
         save_interval,
         max_saved_points,
         saved_counts_out,
-        kernel_ms_out);
+        collect_timing ? &kernel_ms : nullptr,
+        timing ? &timing->alloc_ms : nullptr,
+        timing ? &timing->upload_particles_ms : nullptr,
+        timing ? &timing->download_results_ms : nullptr,
+        timing ? &timing->free_ms : nullptr);
+    if (timing) timing->kernel_ms += kernel_ms;
+    if (kernel_ms_out) *kernel_ms_out += kernel_ms;
 
+    auto t_release = collect_timing ? gpu_timer_now() : Clock::time_point{};
     field.release();
+    if (timing) {
+        timing->field_release_ms += gpu_timer_ms_since(t_release);
+        timing->pipeline_wall_ms += gpu_timer_ms_since(t_pipeline);
+    }
 }
 
 void TracePathlineBatch(MPASOGrid*      grid,
@@ -148,10 +187,17 @@ void TracePathlineBatch(MPASOGrid*      grid,
                         int             save_interval,
                         int             max_saved_points,
                         int*            saved_counts_out,
-                        float*          kernel_ms_out)
+                        float*          kernel_ms_out,
+                        GPUTimingBreakdown* timing_out)
 {
     if (grid == nullptr || pSolution == nullptr || vSolution == nullptr) return;
     if (n_particles <= 0 || n_steps <= 0) return;
+
+    const bool collect_timing = (timing_out != nullptr) || (kernel_ms_out != nullptr);
+    GPUTimingBreakdown local_timing;
+    GPUTimingBreakdown* timing = collect_timing ? (timing_out ? timing_out : &local_timing) : nullptr;
+    auto t_pipeline = collect_timing ? gpu_timer_now() : Clock::time_point{};
+    auto t_host_prepare = collect_timing ? gpu_timer_now() : Clock::time_point{};
 
     MPASODeviceField field;
     field.n_cells            = grid->getNumCell();
@@ -162,6 +208,8 @@ void TracePathlineBatch(MPASOGrid*      grid,
     field.n_timesteps_loaded = grid->getNTimestepsLoaded();
     field.earth_radius       = grid->getEarthRadius();
 
+    if (timing) timing->host_prepare_ms += gpu_timer_ms_since(t_host_prepare);
+    auto t_upload_topology = collect_timing ? gpu_timer_now() : Clock::time_point{};
     field.uploadTopology(
         reinterpret_cast<const mpaso_vec3*>(grid->getCellCoord()),
         reinterpret_cast<const mpaso_vec3*>(grid->getVertexCoord()),
@@ -169,7 +217,9 @@ void TracePathlineBatch(MPASOGrid*      grid,
         grid->getCellsOnCell(),
         grid->getNumVerticesOnCell(),
         grid->getMaxLevelCell());
+    if (timing) timing->upload_topology_ms += gpu_timer_ms_since(t_upload_topology);
 
+    if (collect_timing) t_host_prepare = gpu_timer_now();
     const int n_vert_nodes = field.n_local_vertices * field.n_vert_levels;
     const int n_ts         = field.n_timesteps_loaded;
 
@@ -183,8 +233,12 @@ void TracePathlineBatch(MPASOGrid*      grid,
     std::vector<double> h_timestamps(n_ts, 0.0);
     for (int i = 0; i < n_ts && i < (int)ts.size(); ++i) h_timestamps[i] = ts[i];
 
+    if (timing) timing->host_prepare_ms += gpu_timer_ms_since(t_host_prepare);
+    auto t_upload_velocity = collect_timing ? gpu_timer_now() : Clock::time_point{};
     field.uploadVelocityWindow(h_vel.data(), h_vvel.data(), h_ztop, h_timestamps.data());
+    if (timing) timing->upload_velocity_ms += gpu_timer_ms_since(t_upload_velocity);
 
+    float kernel_ms = 0.0f;
     mpaso_gpu::LaunchPathlineTracer(
         field,
         reinterpret_cast<const mpaso_vec3*>(seeds),
@@ -201,9 +255,20 @@ void TracePathlineBatch(MPASOGrid*      grid,
         save_interval,
         max_saved_points,
         saved_counts_out,
-        kernel_ms_out);
+        collect_timing ? &kernel_ms : nullptr,
+        timing ? &timing->alloc_ms : nullptr,
+        timing ? &timing->upload_particles_ms : nullptr,
+        timing ? &timing->download_results_ms : nullptr,
+        timing ? &timing->free_ms : nullptr);
+    if (timing) timing->kernel_ms += kernel_ms;
+    if (kernel_ms_out) *kernel_ms_out += kernel_ms;
 
+    auto t_release = collect_timing ? gpu_timer_now() : Clock::time_point{};
     field.release();
+    if (timing) {
+        timing->field_release_ms += gpu_timer_ms_since(t_release);
+        timing->pipeline_wall_ms += gpu_timer_ms_since(t_pipeline);
+    }
 }
 
 } // namespace mpaso_gpu_host

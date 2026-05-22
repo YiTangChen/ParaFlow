@@ -39,6 +39,7 @@ Thumbs.db
 /NERSC_job/
 /partition/
 rendering/render_log_*.txt
+/LIC/
 
 # Generated figures
 *.png

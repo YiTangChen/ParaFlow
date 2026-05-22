@@ -2,6 +2,7 @@
 #include "MPASOVelocity.cuh"
 
 #include <cuda_runtime.h>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
@@ -266,6 +267,18 @@ inline void cudaCheck(cudaError_t err, const char* what) {
     }
 }
 
+using HostClock = std::chrono::steady_clock;
+
+inline HostClock::time_point host_timer_now()
+{
+    return HostClock::now();
+}
+
+inline float host_timer_ms_since(HostClock::time_point start)
+{
+    return std::chrono::duration<float, std::milli>(HostClock::now() - start).count();
+}
+
 } // namespace
 
 namespace mpaso_gpu {
@@ -286,7 +299,11 @@ void LaunchTracer(const MPASODeviceField& field,
                   int               save_interval,
                   int               max_saved_points,
                   int*              h_saved_counts_out,
-                  float*            kernel_ms_out)
+                  float*            kernel_ms_out,
+                  float*            alloc_ms_out,
+                  float*            upload_particles_ms_out,
+                  float*            download_results_ms_out,
+                  float*            free_ms_out)
 {
     if (n_particles <= 0 || n_steps <= 0) return;
 
@@ -312,6 +329,7 @@ void LaunchTracer(const MPASODeviceField& field,
                              * static_cast<size_t>(max_saved_eff)
                              * sizeof(mpaso_vec3);
 
+    auto t_alloc = host_timer_now();
     cudaCheck(cudaMalloc(&d_seeds,        seed_bytes),   "alloc seeds");
     cudaCheck(cudaMalloc(&d_seed_cell_id, cellid_bytes), "alloc seed_cell_id");
     if (h_seed_max_steps)
@@ -325,13 +343,18 @@ void LaunchTracer(const MPASODeviceField& field,
         cudaCheck(cudaMalloc(&d_final_cell, cellid_bytes), "alloc final_cell");
     if (h_saved_counts_out)
         cudaCheck(cudaMalloc(&d_saved_counts, cellid_bytes), "alloc saved_counts");
+    if (alloc_ms_out)
+        *alloc_ms_out += host_timer_ms_since(t_alloc);
 
+    auto t_upload_particles = host_timer_now();
     cudaCheck(cudaMemcpy(d_seeds,        h_seeds,        seed_bytes,   cudaMemcpyHostToDevice), "copy seeds");
     cudaCheck(cudaMemcpy(d_seed_cell_id, h_seed_cell_id, cellid_bytes, cudaMemcpyHostToDevice), "copy seed_cell_id");
     if (h_seed_max_steps)
         cudaCheck(cudaMemcpy(d_max_steps, h_seed_max_steps, cellid_bytes, cudaMemcpyHostToDevice), "copy seed_max_steps");
     if (h_seed_step_offset)
         cudaCheck(cudaMemcpy(d_step_offset, h_seed_step_offset, cellid_bytes, cudaMemcpyHostToDevice), "copy seed_step_offset");
+    if (upload_particles_ms_out)
+        *upload_particles_ms_out += host_timer_ms_since(t_upload_particles);
 
     const int block = 128;
     const int grid  = (n_particles + block - 1) / block;
@@ -355,6 +378,7 @@ void LaunchTracer(const MPASODeviceField& field,
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_stop);
 
+    auto t_download_results = host_timer_now();
     cudaCheck(cudaMemcpy(h_traces_out, d_traces, trace_bytes, cudaMemcpyDeviceToHost), "copy traces");
     if (h_steps_taken_out)
         cudaCheck(cudaMemcpy(h_steps_taken_out, d_steps_taken, cellid_bytes, cudaMemcpyDeviceToHost), "copy steps_taken");
@@ -362,7 +386,10 @@ void LaunchTracer(const MPASODeviceField& field,
         cudaCheck(cudaMemcpy(h_final_cell_out, d_final_cell, cellid_bytes, cudaMemcpyDeviceToHost), "copy final_cell");
     if (h_saved_counts_out)
         cudaCheck(cudaMemcpy(h_saved_counts_out, d_saved_counts, cellid_bytes, cudaMemcpyDeviceToHost), "copy saved_counts");
+    if (download_results_ms_out)
+        *download_results_ms_out += host_timer_ms_since(t_download_results);
 
+    auto t_free = host_timer_now();
     cudaFree(d_seeds);
     cudaFree(d_seed_cell_id);
     cudaFree(d_max_steps);
@@ -371,6 +398,8 @@ void LaunchTracer(const MPASODeviceField& field,
     cudaFree(d_steps_taken);
     cudaFree(d_final_cell);
     cudaFree(d_saved_counts);
+    if (free_ms_out)
+        *free_ms_out += host_timer_ms_since(t_free);
 }
 
 } // namespace mpaso_gpu
@@ -585,7 +614,11 @@ void LaunchPathlineTracer(const MPASODeviceField& field,
                           int               save_interval,
                           int               max_saved_points,
                           int*              h_saved_counts_out,
-                          float*            kernel_ms_out)
+                          float*            kernel_ms_out,
+                          float*            alloc_ms_out,
+                          float*            upload_particles_ms_out,
+                          float*            download_results_ms_out,
+                          float*            free_ms_out)
 {
     if (n_particles <= 0 || n_steps <= 0) return;
 
@@ -609,6 +642,7 @@ void LaunchPathlineTracer(const MPASODeviceField& field,
     const size_t db  = (size_t)n_particles * sizeof(double);
     const size_t tb  = (size_t)n_particles * (size_t)max_saved_eff * sizeof(mpaso_vec3);
 
+    auto t_alloc = host_timer_now();
     cudaCheck(cudaMalloc(&d_seeds,       sb), "pl alloc seeds");
     cudaCheck(cudaMalloc(&d_cell,        cb), "pl alloc cell");
     cudaCheck(cudaMalloc(&d_max_steps,   cb), "pl alloc max_steps");
@@ -619,11 +653,16 @@ void LaunchPathlineTracer(const MPASODeviceField& field,
     cudaCheck(cudaMalloc(&d_final_cell,  cb), "pl alloc final_cell");
     if (h_saved_counts_out)
         cudaCheck(cudaMalloc(&d_saved_counts, cb), "pl alloc saved_counts");
+    if (alloc_ms_out)
+        *alloc_ms_out += host_timer_ms_since(t_alloc);
 
+    auto t_upload_particles = host_timer_now();
     cudaCheck(cudaMemcpy(d_seeds,     h_seeds,           sb, cudaMemcpyHostToDevice), "pl cpy seeds");
     cudaCheck(cudaMemcpy(d_cell,      h_seed_cell_id,    cb, cudaMemcpyHostToDevice), "pl cpy cell");
     cudaCheck(cudaMemcpy(d_max_steps, h_seed_max_steps,  cb, cudaMemcpyHostToDevice), "pl cpy max_steps");
     cudaCheck(cudaMemcpy(d_t_start,   h_seed_t_start,    db, cudaMemcpyHostToDevice), "pl cpy t_start");
+    if (upload_particles_ms_out)
+        *upload_particles_ms_out += host_timer_ms_since(t_upload_particles);
 
     const int block = 128;
     const int grid  = (n_particles + block - 1) / block;
@@ -646,16 +685,22 @@ void LaunchPathlineTracer(const MPASODeviceField& field,
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_stop);
 
+    auto t_download_results = host_timer_now();
     cudaCheck(cudaMemcpy(h_traces_out,      d_traces,      tb, cudaMemcpyDeviceToHost), "pl cpy traces");
     cudaCheck(cudaMemcpy(h_final_time_out,  d_final_time,  db, cudaMemcpyDeviceToHost), "pl cpy final_time");
     cudaCheck(cudaMemcpy(h_steps_taken_out, d_steps_taken, cb, cudaMemcpyDeviceToHost), "pl cpy steps_taken");
     cudaCheck(cudaMemcpy(h_final_cell_out,  d_final_cell,  cb, cudaMemcpyDeviceToHost), "pl cpy final_cell");
     if (h_saved_counts_out)
         cudaCheck(cudaMemcpy(h_saved_counts_out, d_saved_counts, cb, cudaMemcpyDeviceToHost), "pl cpy saved_counts");
+    if (download_results_ms_out)
+        *download_results_ms_out += host_timer_ms_since(t_download_results);
 
+    auto t_free = host_timer_now();
     cudaFree(d_seeds); cudaFree(d_cell); cudaFree(d_max_steps); cudaFree(d_t_start);
     cudaFree(d_traces); cudaFree(d_final_time); cudaFree(d_steps_taken); cudaFree(d_final_cell);
     cudaFree(d_saved_counts);
+    if (free_ms_out)
+        *free_ms_out += host_timer_ms_since(t_free);
 }
 
 } // namespace mpaso_gpu

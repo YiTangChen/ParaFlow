@@ -28,6 +28,19 @@ class Solution;
 
 namespace mpaso_gpu_host {
 
+struct GPUTimingBreakdown {
+    float pipeline_wall_ms    = 0.0f;  // full wrapper wall time, excluding ParaFlow postprocess
+    float host_prepare_ms     = 0.0f;  // host metadata packing / Solution flattening
+    float upload_topology_ms  = 0.0f;  // block-local static mesh upload
+    float upload_velocity_ms  = 0.0f;  // velocity / zTop / timestamp window upload
+    float alloc_ms            = 0.0f;  // per-launch CUDA allocations
+    float upload_particles_ms = 0.0f;  // particle arrays host-to-device copies
+    float kernel_ms           = 0.0f;  // CUDA Event kernel time
+    float download_results_ms = 0.0f;  // device-to-host output copies
+    float free_ms             = 0.0f;  // per-launch CUDA frees
+    float field_release_ms    = 0.0f;  // release uploaded topology/velocity buffers
+};
+
 // Returns true if at least one CUDA device is visible at runtime.
 // Safe to call without a CUDA context; returns false on any cudaError.
 bool isAvailable();
@@ -51,7 +64,8 @@ void TraceParticles(MPASOGrid*       grid,
                     int              save_interval = 1,
                     int              max_saved_points = 0,
                     int*             saved_counts_out = nullptr,
-                    float*           kernel_ms_out = nullptr);  // CUDA Event kernel time (ms), accumulated
+                    float*           kernel_ms_out = nullptr,   // CUDA Event kernel time (ms), accumulated
+                    GPUTimingBreakdown* timing_out = nullptr);
 
 // Pathline batch tracer. Like TraceParticles, but per-seed start times and
 // temporal velocity blending. The uploaded window's timestamps come from
@@ -78,7 +92,8 @@ void TracePathlineBatch(MPASOGrid*       grid,
                         int              save_interval = 1,
                         int              max_saved_points = 0,
                         int*             saved_counts_out = nullptr,
-                        float*           kernel_ms_out = nullptr);  // CUDA Event kernel time (ms)
+                        float*           kernel_ms_out = nullptr,   // CUDA Event kernel time (ms)
+                        GPUTimingBreakdown* timing_out = nullptr);
 
 } // namespace mpaso_gpu_host
 
