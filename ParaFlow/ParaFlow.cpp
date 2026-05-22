@@ -4,6 +4,7 @@
 
 #ifdef OSUFLOW_ENABLE_CUDA
 #include "GPU/CUDA/MPASOGPUTracer.h"
+#include <cuda_runtime.h>
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
@@ -36,6 +37,40 @@ static double gpu_smoke_env_double(const char* name, double fallback)
 static int gpu_streamline_chunk_steps()
 {
     return gpu_smoke_env_int("OSUFLOW_GPU_STREAMLINE_CHUNK_STEPS", 43200);
+}
+
+static void print_gpu_rank_mapping(int rank, int gid)
+{
+    const char* visible = std::getenv("CUDA_VISIBLE_DEVICES");
+    int device_count = 0;
+    cudaError_t count_err = cudaGetDeviceCount(&device_count);
+    if (count_err != cudaSuccess || device_count <= 0) {
+        std::fprintf(stderr,
+            "GPU_RANK_MAP rank=%d gid=%d CUDA_VISIBLE_DEVICES=%s selected_device=-1 device_count=0 gpu_name=\"unavailable\" cuda_error=\"%s\"\n",
+            rank, gid, visible ? visible : "(unset)",
+            cudaGetErrorString(count_err));
+        (void)cudaGetLastError();
+        return;
+    }
+
+    int selected = -1;
+    cudaError_t dev_err = cudaGetDevice(&selected);
+    if (dev_err != cudaSuccess || selected < 0 || selected >= device_count) {
+        std::fprintf(stderr,
+            "GPU_RANK_MAP rank=%d gid=%d CUDA_VISIBLE_DEVICES=%s selected_device=-1 device_count=%d gpu_name=\"unavailable\" cuda_error=\"%s\"\n",
+            rank, gid, visible ? visible : "(unset)", device_count,
+            cudaGetErrorString(dev_err));
+        (void)cudaGetLastError();
+        return;
+    }
+
+    cudaDeviceProp prop;
+    cudaError_t prop_err = cudaGetDeviceProperties(&prop, selected);
+    std::fprintf(stderr,
+        "GPU_RANK_MAP rank=%d gid=%d CUDA_VISIBLE_DEVICES=%s selected_device=%d device_count=%d gpu_name=\"%s\"\n",
+        rank, gid, visible ? visible : "(unset)", selected, device_count,
+        (prop_err == cudaSuccess) ? prop.name : "unavailable");
+    if (prop_err != cudaSuccess) (void)cudaGetLastError();
 }
 
 static void accumulate_gpu_timing(BlockTiming& timing,
@@ -212,10 +247,20 @@ static void run_gpu_smoke_test(Block* b, int rank)
     std::vector<VECTOR3> gpu_trace(n_particles * (n_steps + 1));
     std::fprintf(stderr, "[GPU parity] launching: P=%d, steps=%d, dt=%.1f\n",
                  n_particles, n_steps, dt);
-    mpaso_gpu_host::TraceParticles(grid, pSol, vSol,
-                                   seeds.data(), seed_cells.data(), n_particles,
-                                   n_steps, dt, /*t_start=*/0.0, /*use_euler=*/false,
-                                   gpu_trace.data());
+    mpaso_gpu_host::GPUBlockContext* gpu_context =
+        mpaso_gpu_host::CreateGPUBlockContext(grid);
+    if (gpu_context == nullptr) {
+        std::fprintf(stderr, "[GPU parity] FAILED: could not create GPU context\n");
+        return;
+    }
+    mpaso_gpu_host::UploadGPUVelocityWindow(
+        gpu_context, grid, pSol, vSol, /*use_real_timestamps=*/false);
+    mpaso_gpu_host::TraceParticlesOnGPUContext(
+        gpu_context,
+        seeds.data(), seed_cells.data(), n_particles,
+        n_steps, dt, /*t_start=*/0.0, /*use_euler=*/false,
+        gpu_trace.data());
+    mpaso_gpu_host::DestroyGPUBlockContext(gpu_context);
 
     // ---- compare ----
     const double earth = earth_r;
@@ -393,16 +438,26 @@ static void run_gpu_pathline_parity_test(Block* b, int rank)
                  n_particles, n_steps, dt, t_start);
     // save_interval=1, max_saved_points=n_steps+1: store every step so the
     // step-by-step CPU/GPU comparison below works with the same row stride.
-    mpaso_gpu_host::TracePathlineBatch(grid, pSol, vSol,
-                                       seeds.data(), seed_cells.data(), seed_t_start.data(),
-                                       gpu_seed_max_steps.data(),
-                                       n_particles, n_steps, dt,
-                                       gpu_trace.data(),
-                                       gpu_final_time.data(),
-                                       gpu_steps_taken.data(),
-                                       gpu_final_cell.data(),
-                                       /*save_interval=*/1,
-                                       /*max_saved_points=*/n_steps + 1);
+    mpaso_gpu_host::GPUBlockContext* gpu_context =
+        mpaso_gpu_host::CreateGPUBlockContext(grid);
+    if (gpu_context == nullptr) {
+        std::fprintf(stderr, "[GPU pathline parity] FAILED: could not create GPU context\n");
+        return;
+    }
+    mpaso_gpu_host::UploadGPUVelocityWindow(
+        gpu_context, grid, pSol, vSol, /*use_real_timestamps=*/true);
+    mpaso_gpu_host::TracePathlineBatchOnGPUContext(
+        gpu_context,
+        seeds.data(), seed_cells.data(), seed_t_start.data(),
+        gpu_seed_max_steps.data(),
+        n_particles, n_steps, dt,
+        gpu_trace.data(),
+        gpu_final_time.data(),
+        gpu_steps_taken.data(),
+        gpu_final_cell.data(),
+        /*save_interval=*/1,
+        /*max_saved_points=*/n_steps + 1);
+    mpaso_gpu_host::DestroyGPUBlockContext(gpu_context);
 
     // ---- compare ----
     double max_abs = 0.0, max_rel = 0.0;
@@ -861,6 +916,20 @@ void ParaFlow::trace_block_gpu(Block*                             b,
         pf_accum(b->timing.t_trace_prepare, _t_prepare, enable_timing);
 
         mpaso_gpu_host::GPUTimingBreakdown gpu_timing;
+        if (b->gpuContext == nullptr)
+            b->gpuContext = mpaso_gpu_host::CreateGPUBlockContext(
+                grid, enable_timing ? &gpu_timing : nullptr);
+        if (b->gpuContext == nullptr) {
+            std::fprintf(stderr,
+                "[ParaFlow] GPU streamline skipped for gid=%d: could not create GPU context, using CPU\n",
+                cp.gid());
+            this->trace_block(b, cp);
+            return;
+        }
+        mpaso_gpu_host::UploadGPUVelocityWindow(
+            b->gpuContext, grid, pSol, vSol,
+            /*use_real_timestamps=*/false,
+            enable_timing ? &gpu_timing : nullptr);
         while (active_count > 0)
         {
             double _t_batch_prepare = pf_now(enable_timing);
@@ -898,24 +967,25 @@ void ParaFlow::trace_block_gpu(Block*                             b,
             std::vector<int> gpu_saved_counts(n_launch, 0);
             pf_accum(b->timing.t_trace_prepare, _t_batch_prepare, enable_timing);
 
-            mpaso_gpu_host::TraceParticles(grid, pSol, vSol,
-                                           launch_seeds.data(),
-                                           launch_cells.data(),
-                                           n_launch,
-                                           launchSteps,
-                                           b->integrationDt,
-                                           /*t_start=*/0.0,
-                                           /*use_euler=*/false,
-                                           gpu_trace.data(),
-                                           launch_max_steps.data(),
-                                           launch_step_offsets.data(),
-                                           gpu_steps_taken.data(),
-                                           gpu_final_cell.data(),
-                                           saveInterval,
-                                           maxSaved,
-                                           gpu_saved_counts.data(),
-                                           nullptr,
-                                           enable_timing ? &gpu_timing : nullptr);
+            mpaso_gpu_host::TraceParticlesOnGPUContext(
+                b->gpuContext,
+                launch_seeds.data(),
+                launch_cells.data(),
+                n_launch,
+                launchSteps,
+                b->integrationDt,
+                /*t_start=*/0.0,
+                /*use_euler=*/false,
+                gpu_trace.data(),
+                launch_max_steps.data(),
+                launch_step_offsets.data(),
+                gpu_steps_taken.data(),
+                gpu_final_cell.data(),
+                saveInterval,
+                maxSaved,
+                gpu_saved_counts.data(),
+                nullptr,
+                enable_timing ? &gpu_timing : nullptr);
 
             double _t_post = pf_now(enable_timing);
             double enqueue_local = 0.0;
@@ -1081,6 +1151,8 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         master.add(gid, b, link); // add block to the master (mandatory)
 
 #ifdef OSUFLOW_ENABLE_CUDA
+        if (this->useGPU)
+            print_gpu_rank_mapping(rank, gid);
         run_gpu_smoke_test(b, rank);
 #endif
     }
@@ -1164,9 +1236,10 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
                 fprintf(stderr,
                     "TIMING phase=gpu_free rank=%d gid=%d t=%.6f\n",
                     b->rank, cp.gid(), b->timing.t_gpu_free);
-                fprintf(stderr,
-                    "TIMING phase=gpu_field_release rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_field_release);
+                if (b->timing.t_gpu_field_release > 0.0)
+                    fprintf(stderr,
+                        "TIMING phase=gpu_field_release rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_gpu_field_release);
             }
             fprintf(stderr,
                 "TIMING phase=trace_dequeue rank=%d gid=%d t=%.6f\n",
@@ -1409,25 +1482,40 @@ void ParaFlow::trace_block_pathline_gpu(Block*                              b,
         std::vector<int>     gpu_final_cell(n_particles, -1);
         std::vector<int>     gpu_saved_counts(n_particles, 0);
         mpaso_gpu_host::GPUTimingBreakdown gpu_timing;
+        if (b->gpuContext == nullptr)
+            b->gpuContext = mpaso_gpu_host::CreateGPUBlockContext(
+                grid, enable_timing ? &gpu_timing : nullptr);
+        if (b->gpuContext == nullptr) {
+            std::fprintf(stderr,
+                "[ParaFlow] GPU pathline skipped for gid=%d: could not create GPU context, using CPU\n",
+                cp.gid());
+            this->trace_block_pathline(b, cp);
+            return;
+        }
+        mpaso_gpu_host::UploadGPUVelocityWindow(
+            b->gpuContext, grid, pSol, vSol,
+            /*use_real_timestamps=*/true,
+            enable_timing ? &gpu_timing : nullptr);
         pf_accum(b->timing.t_trace_prepare, _t_prepare, enable_timing);
 
-        mpaso_gpu_host::TracePathlineBatch(grid, pSol, vSol,
-                                           b->currentSeeds.data(),
-                                           seed_cells.data(),
-                                           tarray.data(),
-                                           seed_max_steps.data(),
-                                           n_particles,
-                                           n_steps,
-                                           dt,
-                                           gpu_trace.data(),
-                                           gpu_final_time.data(),
-                                           gpu_steps_taken.data(),
-                                           gpu_final_cell.data(),
-                                           this->interval,
-                                           max_saved_points,
-                                           gpu_saved_counts.data(),
-                                           nullptr,
-                                           enable_timing ? &gpu_timing : nullptr);
+        mpaso_gpu_host::TracePathlineBatchOnGPUContext(
+            b->gpuContext,
+            b->currentSeeds.data(),
+            seed_cells.data(),
+            tarray.data(),
+            seed_max_steps.data(),
+            n_particles,
+            n_steps,
+            dt,
+            gpu_trace.data(),
+            gpu_final_time.data(),
+            gpu_steps_taken.data(),
+            gpu_final_cell.data(),
+            this->interval,
+            max_saved_points,
+            gpu_saved_counts.data(),
+            nullptr,
+            enable_timing ? &gpu_timing : nullptr);
         if (enable_timing) {
             accumulate_gpu_timing(b->timing, gpu_timing);
         }
@@ -1565,6 +1653,8 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
         master.add(gid, b, link);
 
 #ifdef OSUFLOW_ENABLE_CUDA
+        if (this->useGPU)
+            print_gpu_rank_mapping(rank, gid);
         run_gpu_pathline_parity_test(b, rank);
 #endif
     }
@@ -1709,9 +1799,10 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
                 fprintf(stderr,
                     "TIMING phase=gpu_free rank=%d gid=%d t=%.6f\n",
                     b->rank, cp.gid(), b->timing.t_gpu_free);
-                fprintf(stderr,
-                    "TIMING phase=gpu_field_release rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_field_release);
+                if (b->timing.t_gpu_field_release > 0.0)
+                    fprintf(stderr,
+                        "TIMING phase=gpu_field_release rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_gpu_field_release);
             }
             fprintf(stderr,
                 "TIMING phase=trace_dequeue rank=%d gid=%d t=%.6f\n",

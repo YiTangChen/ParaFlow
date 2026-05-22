@@ -50,6 +50,11 @@ This updates:
 ./build.sh
 ```
 
+For GPU compile:
+```bash
+OSUFLOW_ENABLE_CUDA=1 ./build.sh
+```
+
 ### 5. Generate the subdomain output
 
 ```bash

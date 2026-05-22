@@ -7,6 +7,9 @@
 #include <diy/master.hpp>
 #include "utils.hpp"
 #include "timing.hpp"
+#ifdef OSUFLOW_ENABLE_CUDA
+#include "GPU/CUDA/MPASOGPUTracer.h"
+#endif
 
 using namespace std;
 
@@ -38,10 +41,21 @@ struct Block
     int areaId;
     double integrationDt;
     BlockTiming timing;
-    
+#ifdef OSUFLOW_ENABLE_CUDA
+    mpaso_gpu_host::GPUBlockContext* gpuContext;
+#endif
+
     // following is mandatory
-    Block() : osuflow(nullptr), areaIndicesArr(nullptr), LocalCell2GlobalCell(nullptr), GlobalCell2LocalCell(nullptr) {}
+    Block() : osuflow(nullptr), areaIndicesArr(nullptr), LocalCell2GlobalCell(nullptr), GlobalCell2LocalCell(nullptr)
+#ifdef OSUFLOW_ENABLE_CUDA
+            , gpuContext(nullptr)
+#endif
+    {}
     ~Block() {
+#ifdef OSUFLOW_ENABLE_CUDA
+        mpaso_gpu_host::DestroyGPUBlockContext(gpuContext);
+        gpuContext = nullptr;
+#endif
         delete[] areaIndicesArr;
         delete[] LocalCell2GlobalCell;
         delete[] GlobalCell2LocalCell;
