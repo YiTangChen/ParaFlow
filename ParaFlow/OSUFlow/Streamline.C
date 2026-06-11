@@ -206,6 +206,11 @@ void vtCStreamLine::computeStreamLine(const void* userData,
 			int fromCell = -1;
 			if(fromCells.size()>iterCnt)
 				fromCell = fromCells[iterCnt];
+			// Per-seed step budget (multi-block): cap this seed at its own
+			// remaining budget instead of the batch-wide m_nMaxsize, so a
+			// re-injected streamline cannot be re-granted a fresh budget.
+			if(iterCnt < (int)m_vPerSeedMaxPoints.size())
+				m_nMaxsize = m_vPerSeedMaxPoints[iterCnt];
 			if(m_itsTraceDir & BACKWARD_DIR)
 			{
 				vtListSeedTrace* backTrace;

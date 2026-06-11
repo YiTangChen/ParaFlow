@@ -133,6 +133,7 @@ class OSUFlow
 							vector<int>& toCells, int num_seeds, int maxPoints, double* tarray);
   void SetSaveInterval(int n) { m_nSaveInterval = (n < 1) ? 1 : n; }
   const std::vector<int>& GetLastTraceStepCounts() const { return m_lastTraceStepCounts; }
+  void SetPerSeedMaxPoints(const std::vector<int>& v) { m_vPerSeedMaxPoints = v; }
   void dumpData(string &prefix);
 
  protected:
@@ -194,6 +195,7 @@ class OSUFlow
   double lat_min, lat_max;
   int m_nSaveInterval = 1;                 // store every N-th step inside OSUFlow
   std::vector<int> m_lastTraceStepCounts;  // actual step counts from last Gen*Lines call
+  std::vector<int> m_vPerSeedMaxPoints;    // optional per-seed cap forwarded to the tracer (cleared after use)
 };
 
 #endif

@@ -9,11 +9,6 @@
 // =============================================================================
 // RK4 particle tracer for MPAS-O, ported (trimmed) from MOPS
 // src/GPU/CUDA/Kernel/MPASOVisualizerKernels.cu :: KernelStreamLine.
-//
-// STATUS: skeleton. The three TODO blocks below need to be filled in before
-// this is numerically correct. They are intentionally isolated so the host
-// pipeline (upload -> launch -> download) can be wired and tested first with
-// a stub that returns the seed position unchanged.
 // =============================================================================
 
 namespace {
@@ -116,7 +111,6 @@ __device__ bool rk4_step(mpaso_vec3& p,
     const double r0 = v3_len(p);
     if (r0 <= 0.0) { *cell_id = -1; return false; }
     const mpaso_vec3 pt0 = p;
-    const int        cell0 = *cell_id;
 
     double k1_v, k2_v, k3_v, k4_v;
     mpaso_vec3 k1_h, k2_h, k3_h, k4_h;
@@ -124,6 +118,10 @@ __device__ bool rk4_step(mpaso_vec3& p,
     // Stage 1
     k1_h = sample_velocity(pt0, cell_id, t_rel, f, &k1_v);
     if (*cell_id < 0) return false;
+    // cell0 = the cell freshly resolved at pt0 by stage 1 (matches CPU
+    // cell0 = ci_tmp.inCell); capturing it before stage 1 feeds stages 2-4 a
+    // one-step-stale hint and makes the single-pass walk fail early.
+    const int cell0 = *cell_id;
 
     // Stage 2
     mpaso_vec3 pt1; double r1;
@@ -460,7 +458,6 @@ __device__ bool rk4_step_pathline(mpaso_vec3& p,
     const double r0 = v3_len(p);
     if (r0 <= 0.0) { *cell_id = -1; return false; }
     const mpaso_vec3 pt0 = p;
-    const int        cell0 = *cell_id;
 
     double k1_v, k2_v, k3_v, k4_v;
     mpaso_vec3 k1_h, k2_h, k3_h, k4_h;
@@ -468,6 +465,11 @@ __device__ bool rk4_step_pathline(mpaso_vec3& p,
     // Stage 1: (pt0, t_cur)
     k1_h = sample_velocity_t(pt0, cell_id, t_cur, f, &k1_v);
     if (*cell_id < 0) return false;
+    // cell0 = the cell FRESHLY resolved at pt0 by stage 1 (matches the CPU's
+    // cell0 = ci_tmp.inCell). Capturing it before stage 1 would feed stages 2-4
+    // a one-step-stale hint, making the single-pass walk fail earlier than the
+    // CPU and the pathline terminate prematurely.
+    const int cell0 = *cell_id;
 
     // Stage 2: (pt1, t_cur + dt/2)
     mpaso_vec3 pt1; double r1;
@@ -477,7 +479,9 @@ __device__ bool rk4_step_pathline(mpaso_vec3& p,
     int cell_walk = cell0;
     const double t_mid = t_cur + 0.5 * dt;
     k2_h = sample_velocity_t(pt1, &cell_walk, t_mid, f, &k2_v);
-    if (cell_walk < 0) { *cell_id = -1; return false; }
+    // On a sub-stage sample failure the CPU advances to the sub-stage point
+    // (FieldLine.C:276: ci.phyCoord = pt1) and stores it, so the GPU must too.
+    if (cell_walk < 0) { p = pt1; *cell_id = -1; return false; }
 
     // Stage 3: (pt2, t_cur + dt/2)
     mpaso_vec3 pt2; double r2;
@@ -486,7 +490,7 @@ __device__ bool rk4_step_pathline(mpaso_vec3& p,
     }
     cell_walk = cell0;
     k3_h = sample_velocity_t(pt2, &cell_walk, t_mid, f, &k3_v);
-    if (cell_walk < 0) { *cell_id = -1; return false; }
+    if (cell_walk < 0) { p = pt2; *cell_id = -1; return false; }  // FieldLine.C:285
 
     // Stage 4: (pt3, t_cur + dt)
     mpaso_vec3 pt3; double r3;
@@ -496,7 +500,7 @@ __device__ bool rk4_step_pathline(mpaso_vec3& p,
     cell_walk = cell0;
     const double t_end = t_cur + dt;
     k4_h = sample_velocity_t(pt3, &cell_walk, t_end, f, &k4_v);
-    if (cell_walk < 0) { *cell_id = -1; return false; }
+    if (cell_walk < 0) { p = pt3; *cell_id = -1; return false; }  // FieldLine.C:295
 
     mpaso_vec3 v_avg_h = {
         (k1_h.x + 2.0*k2_h.x + 2.0*k3_h.x + k4_h.x) / 6.0,
@@ -548,6 +552,24 @@ __global__ void kernelTracePathline(MPASODeviceField f,
     double t        = seed_t_start[gid];
     int max_steps_for_seed = seed_max_steps[gid];
     int saved_count = 0;
+    const double kStationaryCutoff = 1.0e-5;  // vtCFieldLine::m_fStationaryCutoff
+
+    // CPU seed-time check (TimeVaryingFieldLine.C:239-252): emit no trajectory if
+    // the seed is out of the domain or stationary.
+    {
+        double seed_vv; int seed_cell = cell_id;
+        mpaso_vec3 seed_vh = sample_velocity_t(p, &seed_cell, t, f, &seed_vv);
+        if (seed_cell < 0 ||
+            (fabs(seed_vh.x) < kStationaryCutoff &&
+             fabs(seed_vh.y) < kStationaryCutoff &&
+             fabs(seed_vh.z) < kStationaryCutoff)) {
+            final_time_out[gid]  = t;
+            steps_taken_out[gid] = 0;
+            final_cell_out[gid]  = (seed_cell < 0) ? -1 : cell_id;
+            if (saved_counts_out) saved_counts_out[gid] = 0;
+            return;
+        }
+    }
     trace_save_point(traces_out, row, max_saved_points, &saved_count, p);
 
     int steps_taken = 0;
@@ -562,15 +584,8 @@ __global__ void kernelTracePathline(MPASODeviceField f,
 
     for (int s = 0; s < n_steps && s < max_steps_for_seed; ++s) {
         if (f.n_timesteps_loaded > 1 &&
-            t + dt > f.d_timestamps[f.n_timesteps_loaded - 1] + 1.0e-9) {
-            trace_save_final(traces_out, row, max_saved_points, &saved_count, p);
-            trace_pad_points(traces_out, row, max_saved_points, saved_count, p);
-            final_time_out[gid]  = t;
-            steps_taken_out[gid] = steps_taken;
-            final_cell_out[gid]  = cell_id;
-            if (saved_counts_out) saved_counts_out[gid] = saved_count;
-            return;
-        }
+            t + dt > f.d_timestamps[f.n_timesteps_loaded - 1] + 1.0e-9)
+            break;  // out of loaded time window; driver reinjects into next window
         int prev_cell = cell_id;
         bool ok = rk4_step_pathline(p, &cell_id, dt, t, f);
         if (!ok || cell_id < 0) {
@@ -586,6 +601,20 @@ __global__ void kernelTracePathline(MPASODeviceField f,
         ++steps_taken;
         if ((steps_taken % save_interval) == 0)
             trace_save_point(traces_out, row, max_saved_points, &saved_count, p);
+
+        // CPU post-step check (TimeVaryingFieldLine.C:350-388): resample at the
+        // new position/time, refresh the cell hint, and stop on out-of-bound or
+        // a stationary (critical) point so the GPU terminates where the CPU does.
+        double post_vv;
+        int post_cell = cell_id;
+        mpaso_vec3 post_vh = sample_velocity_t(p, &post_cell, t, f, &post_vv);
+        if (post_cell < 0)
+            break;
+        cell_id = post_cell;
+        if (fabs(post_vh.x) < kStationaryCutoff &&
+            fabs(post_vh.y) < kStationaryCutoff &&
+            fabs(post_vh.z) < kStationaryCutoff)
+            break;
     }
     trace_save_final(traces_out, row, max_saved_points, &saved_count, p);
     trace_pad_points(traces_out, row, max_saved_points, saved_count, p);

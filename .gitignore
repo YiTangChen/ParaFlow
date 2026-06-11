@@ -40,6 +40,7 @@ Thumbs.db
 /partition/
 rendering/render_log_*.txt
 /LIC/
+/debug/
 
 # Generated figures
 *.png

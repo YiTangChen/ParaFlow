@@ -36,6 +36,13 @@ struct MPASODeviceField {
 
     // ----- global scalars -----
     double earth_radius    = 0.0;  // mirrors MPASOGrid::earth_radius
+    // lat/lon bounding box (radians), mirrors MPASOGrid::isInBBox. The domain is
+    // not global in longitude, so the CPU terminates trajectories that leave
+    // this box; the GPU must do the same to match.
+    double lat_min         = 0.0;
+    double lat_max         = 0.0;
+    double lon_center      = 0.0;
+    double lon_half_width  = 0.0;
 
     // ----- topology (time-independent, device pointers) -----
     mpaso_vec3* d_cell_coord           = nullptr;  // [n_cells]

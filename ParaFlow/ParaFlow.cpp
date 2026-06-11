@@ -765,12 +765,21 @@ void ParaFlow::trace_block(Block*                               b,
         double _t_prepare = pf_now(enable_timing);
         // std::cerr << "[rank " << b->rank << ", gid " << cp.gid() << "] Tracing " << b->currentSeeds.size() << " seeds\n";
         int maxRemaining = 0;
-        for (auto& pt : b->startPts)
-            maxRemaining = std::max(maxRemaining, pf_remaining_steps(this->max_steps, pt.nsteps));
+        std::vector<int> perSeedMax;
+        perSeedMax.reserve(b->startPts.size());
+        for (auto& pt : b->startPts) {
+            int rem = pf_remaining_steps(this->max_steps, pt.nsteps);
+            maxRemaining = std::max(maxRemaining, rem);
+            // Per-seed budget: each streamline gets its OWN remaining budget so a
+            // re-injected seed is not re-granted a fresh (batch-max) budget. This
+            // matches the GPU's per-seed cap (trace_block_gpu) and makes the total
+            // step count partition-invariant.
+            perSeedMax.push_back(rem);
+        }
         pf_accum(b->timing.t_trace_prepare, _t_prepare, enable_timing);
 
         double _t_comp = pf_now(enable_timing);
-        b->GenStreamLineByOSUFlow(maxRemaining, this->interval);
+        b->GenStreamLineByOSUFlow(maxRemaining, this->interval, perSeedMax);
         pf_accum(b->timing.t_trace_integrate_cpu, _t_comp, enable_timing);
         if (enable_timing)
             for (auto s : b->sl_stepcounts) b->timing.n_steps_total += s;
@@ -799,7 +808,13 @@ void ParaFlow::trace_block(Block*                               b,
             if (seedCnt < (int)b->sl_stepcounts.size())
                 currseg.nsteps += b->sl_stepcounts[seedCnt];
 
-            if(pf_finished_by_steps(this->max_steps, currseg.nsteps))
+            // A seed that exhausts its per-seed step budget is finished even though
+            // currseg.nsteps tops out at max_steps-1 (the seed counts as one stored
+            // point, so the integrator takes at most maxPoints-1 RK steps). Mirrors
+            // the GPU's budget-exhausted check in trace_block_gpu.
+            if(pf_finished_by_steps(this->max_steps, currseg.nsteps) ||
+               (!pf_unlimited_steps(this->max_steps) &&
+                currseg.nsteps >= this->max_steps - 1))
                 finished = true;
 
             // skip seeds that were out of boundary from the start
@@ -879,6 +894,11 @@ void ParaFlow::trace_block_gpu(Block*                             b,
         std::vector<int> remaining_steps(n_particles, 0);
         for (int i = 0; i < n_particles && i < (int)b->startPts.size(); i++) {
             int remaining = pf_remaining_steps(this->max_steps, b->startPts[i].nsteps);
+            // CPU streamline path (OSUFlow::computeFieldLine with m_nMaxsize) advances
+            // at most (maxsteps - 1) RK steps because the seed counts as one stored point.
+            // Keep GPU launch budget aligned with that legacy CPU semantics.
+            if (!pf_unlimited_steps(this->max_steps))
+                remaining = std::max(0, remaining - 1);
             remaining_steps[i] = remaining;
         }
 
@@ -1011,7 +1031,12 @@ void ParaFlow::trace_block_gpu(Block*                             b,
                 total_steps_taken[seedCnt] += steps;
                 remaining_steps[seedCnt] = std::max(0, remaining_steps[seedCnt] - steps);
 
-                bool finished = pf_finished_by_steps(this->max_steps, seg.nsteps);
+                // A seed that exhausts its step budget is finished even though
+                // seg.nsteps tops out at maxsteps-1 (the seed counts as one point,
+                // see the remaining-1 above) and so never reaches maxsteps.
+                bool finished = pf_finished_by_steps(this->max_steps, seg.nsteps) ||
+                                (!pf_unlimited_steps(this->max_steps) &&
+                                 remaining_steps[seedCnt] == 0);
                 bool stoppedEarly = steps < launch_max_steps[j] || toCell < 0;
                 int nextNeighborId = b->GetNeighborId(toCell);
                 bool handoff = !finished && nextNeighborId >= 0;
@@ -1438,6 +1463,12 @@ void ParaFlow::trace_block_pathline_gpu(Block*                              b,
         const double maxT = b->getWindowMaxTime();
         for (int i = 0; i < n_particles && i < (int)b->startPts.size(); i++) {
             int remaining = pf_remaining_steps(this->max_steps, b->startPts[i].nsteps);
+            // Match CPU pathline budget: vtCPathLine counts the seed as one stored
+            // point (count starts at 1), so it advances at most (maxsteps - 1) RK
+            // steps. Without this the GPU takes one extra step at termination,
+            // shifting each pathline's final point. Mirrors the streamline GPU path.
+            if (!pf_unlimited_steps(this->max_steps))
+                remaining = std::max(0, remaining - 1);
             seed_max_steps[i] = remaining;
             maxRemaining = std::max(maxRemaining, remaining);
             double windowRemaining = maxT - tarray[i];

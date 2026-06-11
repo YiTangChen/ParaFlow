@@ -85,6 +85,11 @@ GPUBlockContext* CreateGPUBlockContext(MPASOGrid* grid,
     field.n_vert_levels_p1   = field.n_vert_levels + 1;
     field.n_timesteps_loaded = grid->getNTimestepsLoaded();
     field.earth_radius       = grid->getEarthRadius();
+    // lat/lon bbox so the device can replicate MPASOGrid::isInBBox.
+    field.lat_min            = grid->getLatMin();
+    field.lat_max            = grid->getLatMax();
+    field.lon_center         = grid->getLonCenter();
+    field.lon_half_width     = grid->getLonHalfWidth();
 
     if (timing_out) timing_out->host_prepare_ms += gpu_timer_ms_since(t_host_prepare);
 

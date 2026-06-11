@@ -47,6 +47,23 @@ __device__ inline mpaso_vec3 v_normalize_scale(mpaso_vec3 a, double target_len) 
     return { a.x * s, a.y * s, a.z * s };
 }
 
+// Device mirror of MPASOGrid::isInBBox (Grid.C:1946) + xyz2latlon/wrapToPi
+// (Grid.h:471,486). The MPAS domain is not global in longitude; the CPU
+// rejects points outside this lat/lon box and terminates the trajectory there,
+// so the GPU must too.
+__device__ inline bool in_bbox_dev(const MPASODeviceField& f, mpaso_vec3 pos) {
+    double lon = atan2(pos.y, pos.x);
+    double lat = atan2(pos.z, hypot(pos.x, pos.y));
+    lon = fmod(lon, 2.0 * M_PI);
+    if (lon < 0.0) lon += 2.0 * M_PI;
+    if (lat < f.lat_min || lat > f.lat_max) return false;
+    double dlon = fmod((lon - f.lon_center) + M_PI, 2.0 * M_PI);  // wrapToPi
+    if (dlon < 0.0) dlon += 2.0 * M_PI;
+    dlon -= M_PI;
+    if (fabs(dlon) > f.lon_half_width) return false;
+    return true;
+}
+
 // Mirrors Grid.C:1140 triangle_area().
 __device__ inline double triangle_area_dev(mpaso_vec3 v1, mpaso_vec3 v2, mpaso_vec3 v3) {
     mpaso_vec3 u = v_sub(v2, v1);
@@ -142,15 +159,18 @@ __device__ inline bool phys_to_cell_dev(
     // --- project onto sphere surface ---
     const double r_mag = v_mag(phys);
     if (r_mag > f.earth_radius || r_mag == 0.0) return false;
+    if (!in_bbox_dev(f, phys)) return false;  // match CPU MPASOGrid::phys_to_cell
     const mpaso_vec3 phys_ontop = v_normalize_scale(phys, f.earth_radius);
 
     // --- nearest-cell walk via cellsOnCell neighbours ---
     if (from_cell_idx < 0 || from_cell_idx >= n_cells) return false;
 
+    // Single 1-ring pass, matching the CPU MPASOGrid::phys_to_cell single-pass
+    // neighbour walk: terminate the line when a step lands more than one ring
+    // away, so the GPU stops where the CPU does.
     int nearest = from_cell_idx;
     mpaso_vec3 d0 = v_sub(phys_ontop, f.d_cell_coord[from_cell_idx]);
     double min_dist2 = v_dot(d0, d0);
-
     const int from_nvoc = f.d_num_vertices_on_cell[from_cell_idx];
     const int from_off  = from_cell_idx * n_max_edges;
     for (int i = 0; i < from_nvoc; ++i) {
@@ -158,10 +178,7 @@ __device__ inline bool phys_to_cell_dev(
         if (nb < 0) continue;
         mpaso_vec3 d = v_sub(phys_ontop, f.d_cell_coord[nb]);
         double dd = v_dot(d, d);
-        if (dd < min_dist2) {
-            min_dist2 = dd;
-            nearest = nb;
-        }
+        if (dd < min_dist2) { min_dist2 = dd; nearest = nb; }
     }
     if (nearest < 0 || nearest >= n_cells) return false;
 
@@ -363,10 +380,13 @@ __device__ inline bool phys_to_cell_dev_blend(
 
     const double r_mag = v_mag(phys);
     if (r_mag > f.earth_radius || r_mag == 0.0) return false;
+    if (!in_bbox_dev(f, phys)) return false;  // match CPU MPASOGrid::phys_to_cell
     const mpaso_vec3 phys_ontop = v_normalize_scale(phys, f.earth_radius);
 
     if (from_cell_idx < 0 || from_cell_idx >= n_cells) return false;
 
+    // Single 1-ring pass, matching the CPU MPASOGrid::phys_to_cell single-pass
+    // neighbour walk (terminate when a step lands more than one ring away).
     int nearest = from_cell_idx;
     mpaso_vec3 d0 = v_sub(phys_ontop, f.d_cell_coord[from_cell_idx]);
     double min_dist2 = v_dot(d0, d0);

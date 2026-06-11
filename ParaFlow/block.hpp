@@ -248,7 +248,8 @@ struct Block
         osuflow->SetSeedPoints(seedsPointer, this->currentSeeds.size());
     }
 
-    void GenStreamLineByOSUFlow(int maxSteps, int saveInterval = 1) {
+    void GenStreamLineByOSUFlow(int maxSteps, int saveInterval = 1,
+                                const std::vector<int>& perSeedMaxPoints = std::vector<int>()) {
         // Free previous trace objects to prevent memory leak:
         // each vtListSeedTrace* and its VECTOR3* elements are heap-allocated by OSUFlow
         // and sl_list does not own them; we must delete them before clearing.
@@ -261,6 +262,7 @@ struct Block
         osuflow->SetIntegrationParams(this->integrationDt, this->integrationDt);
         osuflow->SetIntegrationOrder(MPASO_FOURTH);
         osuflow->SetSaveInterval(saveInterval);
+        osuflow->SetPerSeedMaxPoints(perSeedMaxPoints);
         osuflow->GenStreamLines(this->sl_list, this->fromCells, this->toCells, FORWARD_DIR, maxSteps, 0);
         this->sl_stepcounts = osuflow->GetLastTraceStepCounts();
         // NOTE: segs are built by trace_block in ParaFlow.cpp, not here

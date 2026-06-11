@@ -109,6 +109,7 @@ protected:
 	int m_nSaveInterval;    // store every N-th integration step (1 = store all)
 	int m_lastFieldLineStepCount; // actual steps taken in the last computeFieldLine/advectParticle call
 	std::vector<int> m_traceActualStepCounts; // per-trace step counts accumulated by computeStreamLine/computePathLine
+	std::vector<int> m_vPerSeedMaxPoints; // optional per-seed cap on m_nMaxsize (empty = use m_nMaxsize for all seeds)
 	vtListParticle m_lSeeds;	// list of seeds
 	list<int64_t> m_lSeedIds;	// list of seed ids
 	CVectorField* m_pField;	        // vector field
@@ -124,6 +125,7 @@ public:
 	void setMaxPoints(int val) { m_nMaxsize = val; }
 	void setSaveInterval(int n) { m_nSaveInterval = (n < 1) ? 1 : n; }
 	const std::vector<int>& getTraceActualStepCounts() const { return m_traceActualStepCounts; }
+	void setPerSeedMaxPoints(const std::vector<int>& v) { m_vPerSeedMaxPoints = v; }
 	void setIntegrationOrder(INTEG_ORD ord) { m_integrationOrder = ord; }
 	int  getMaxPoints(void){ return m_nMaxsize; }
 	INTEG_ORD getIntegrationOrder(void){ return m_integrationOrder; }
