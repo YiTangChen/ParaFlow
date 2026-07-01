@@ -30,6 +30,19 @@ enum TIME_DEP{ STEADY=0,UNSTEADY=1 };
 enum TRACE_DIR{OFF=0, BACKWARD_DIR=1, FORWARD_DIR=2, BACKWARD_AND_FORWARD=3};
 enum ADVECT_STATUS{NONE = -3, OUT_OF_TIME = -2, OUT_OF_BOUND = -1, CRITICAL_POINT = 0, OKAY = 1};
 
+struct MPASORK4AuditRecord
+{
+	int stage;          // 1..4, matching k1..k4
+	VECTOR3 samplePoint;
+	double sampleTime;
+	int fromCell;
+	int inCell;
+	int status;
+	VECTOR4 velocity;
+};
+
+typedef void (*MPASORK4AuditHook)(void*, const MPASORK4AuditRecord&);
+
 //////////////////////////////////////////////////////////////////////////
 // information about particles
 //////////////////////////////////////////////////////////////////////////
@@ -113,6 +126,8 @@ protected:
 	vtListParticle m_lSeeds;	// list of seeds
 	list<int64_t> m_lSeedIds;	// list of seed ids
 	CVectorField* m_pField;	        // vector field
+	MPASORK4AuditHook m_mpasoRK4AuditHook;
+	void* m_mpasoRK4AuditUserData;
 	double m_fStationaryCutoff;	// cutoff value for critical points
 
 public:
@@ -135,9 +150,14 @@ public:
 	double GetInitStepSize(void) { return m_fInitStepSize; }
 	void SetLowerUpperAngle(double lowerAngle, double upperAngle) {m_fLowerAngleAccuracy = lowerAngle; m_fUpperAngleAccuracy = upperAngle;}
 	void SetStationaryCutoff(double cutoff) {m_fStationaryCutoff = cutoff;}
+	void SetMPASORK4AuditHook(MPASORK4AuditHook hook, void* userData = NULL);
 
 protected:
 	void releaseSeedMemory(void);
+	void RecordMPASORK4AuditStage(int stage, const VECTOR3& samplePoint,
+								  double sampleTime, int fromCell,
+								  const PointInfo& pointInfo, int status,
+								  const VECTOR4& velocity) const;
 	int euler_cauchy(TIME_DIR, TIME_DEP,double*, double);
 	int runge_kutta4(TIME_DIR, TIME_DEP, PointInfo&, double*, double, int* cachedLowT = NULL);
 	int runge_kutta2(TIME_DIR, TIME_DEP, PointInfo&, double*, double, int* cachedLowT = NULL);

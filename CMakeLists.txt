@@ -41,6 +41,30 @@ set                         (NetCDF_LIBRARIES "${NETCDF_DIR}/lib/libnetcdf.so" "
 
 # ############################################################################## 
 
+add_executable(CpuRK4OneStepAudit)
+target_sources(CpuRK4OneStepAudit
+    PRIVATE
+        "tests/cpu_rk4_one_step_audit.cpp"
+)
+
+target_include_directories(CpuRK4OneStepAudit
+    PRIVATE
+        "./ParaFlow"
+        "./ParaFlow/OSUFlow"
+)
+
+target_link_libraries(CpuRK4OneStepAudit
+    PRIVATE
+        pthread
+        ${NetCDF_LIBRARIES}
+        OSUFlow
+)
+if(OSUFLOW_ENABLE_CUDA)
+    target_link_libraries(CpuRK4OneStepAudit PRIVATE CUDA::cudart)
+endif()
+
+# ##############################################################################
+
 add_executable(DrawSubdomain)
 target_sources(DrawSubdomain
     PRIVATE
