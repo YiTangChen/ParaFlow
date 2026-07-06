@@ -1,9 +1,9 @@
 enable_timing: true
-outputDir: pathlines/nersc_highres
+outputDir: pathlines/nersc_highres_256_cpu_10k
 
 maxsteps: null
 record_interval: 60
-dt: 30.0
+dt: 60.0
 nproc: 256
 nblocks: 256
 meshfile_src: /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.rst.0015-01-01_00000.nc
@@ -43,23 +43,24 @@ datafile_src: [/pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.his
                 /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-10-01.nc,
                 /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-11-01.nc,
                 /pscratch/sd/q/qiuyf/dataset/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0017-12-01.nc]
-graph_partition_indices: highres_6y.info.part.256
+graph_partition_indices: partition/highres_6y.info.part.256
 isBinarySeed: true
-seedFile: seeds/random_seeds.bin
+seedFile: seeds/random_seeds_10k.bin
 
 # time-varying variables
 isTimeVarying: true
 loadNTimeSteps: 16
 velocity:
-  cartesian:     # XYZ
+  cartesian:
     X: null
     Y: null
     Z: null
-  spherical:    # zonal & meridional
+  spherical:
     zonal: null
     meridional: null
-  normal: timeMonthly_avg_normalVelocity   # normal
+  normal: timeMonthly_avg_normalVelocity
 zTop: null
 layerThickness: timeMonthly_avg_layerThickness
 vertVelocityTop: timeMonthly_avg_vertVelocityTop
 xtime: xtime_startMonthly
+useGPU: false

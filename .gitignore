@@ -5,7 +5,6 @@ Thumbs.db
 *.swp
 *.swo
 **/.ipynb_checkpoints/
-**/*~
 
 # CMake / build artifacts
 **/CMakeFiles/
@@ -34,6 +33,7 @@ Thumbs.db
 /pathlines/
 /logs/
 /block_outputs/
+/output/
 /seeds/
 /results/
 /NERSC_job/

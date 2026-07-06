@@ -12,7 +12,7 @@ Prerequisites:
     pip install pyvista --user   (netCDF4 is already on NERSC)
 
     If pathlines.bin does not yet exist, run first:
-        python read_traces.py 256 pathlines/nersc_highres_256_cpu_10k
+        python scripts/plot/read_traces.py 256 pathlines/nersc_highres_256_cpu_10k
 
 Usage:
     # Interactive preview — rotate/zoom with mouse, close to print camera pos:
@@ -115,7 +115,7 @@ def read_pathlines(path):
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"{path} not found.\n"
-            "Run:  python read_traces.py 256 pathlines/nersc_highres_256_cpu_10k"
+            "Run:  python scripts/plot/read_traces.py 256 pathlines/nersc_highres_256_cpu_10k"
         )
     print(f"Reading pathlines: {path}")
     with open(path, "rb") as f:
@@ -388,7 +388,7 @@ def main():
     parser.add_argument("--final", action="store_true",
                         help="Render a single summary image with all complete trajectories "
                              "(every particle's full path from start to end).")
-    parser.add_argument("--config", default="NERSC_job/nersc_highres_256_cpu_10k.yaml",
+    parser.add_argument("--config", default="conf/nersc_highres_cpu.yaml",
                         help="ParaFlow yaml config — used to read dt and record_interval "
                              "for correct real-world timestamps.")
     args = parser.parse_args()
