@@ -71,8 +71,8 @@ list(APPEND SRC_FILES
 
 if(OSUFLOW_ENABLE_CUDA)
     list(APPEND SRC_FILES
-        GPU/CUDA/MPASODeviceField.cu
-        GPU/CUDA/Kernel/MPASOTracerKernels.cu
+        GPU/CUDA/kernels/MPASODeviceField.cu
+        GPU/CUDA/kernels/Kernel/MPASOTracerKernels.cu
         GPU/CUDA/MPASOGPUTracer.cpp
         )
 endif()
@@ -86,9 +86,12 @@ if(OSUFLOW_ENABLE_CUDA)
     target_compile_definitions(${PROJECT_NAME} PUBLIC OSUFLOW_ENABLE_CUDA)
     # Source-root on include path so files under GPU/CUDA can #include
     # top-level headers like VectorMatrix.h / Grid.h / Solution.h.
+    # GPU/CUDA/kernels is the shared kernel-core submodule; MPASOGPUTracer.cpp
+    # #includes "MPASODeviceField.h" / "Kernel/MPASOTracerKernels.h" from it.
     target_include_directories(${PROJECT_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/GPU/CUDA)
+        ${CMAKE_CURRENT_SOURCE_DIR}/GPU/CUDA
+        ${CMAKE_CURRENT_SOURCE_DIR}/GPU/CUDA/kernels)
     # Link CUDA runtime. Static lib still records this as a usage requirement,
     # but downstream executables must also link cudart explicitly because they
     # consume libOSUFlow.a by raw path, not as a CMake target.

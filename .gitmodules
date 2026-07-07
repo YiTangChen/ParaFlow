@@ -1,3 +1,6 @@
 [submodule "ParaFlow/diy"]
 	path = ParaFlow/diy
 	url = https://github.com/diatomic/diy.git
+[submodule "ParaFlow/OSUFlow/GPU/CUDA/kernels"]
+	path = ParaFlow/OSUFlow/GPU/CUDA/kernels
+	url = git@github.com:Jiaxin-yyjx/mpaso-gpu-kernels.git
