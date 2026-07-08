@@ -2,61 +2,63 @@
 #define _TIMING_HPP
 
 #include <mpi.h>
-#include <time.h>
 #include <fstream>
 #include <string>
 #include <cstdio>
 
 // Per-block timing accumulators (stored in each Block instance). All times are in seconds.
 struct BlockTiming {
-    // ── Initialization phase ──────────────────────────────────────────────────
-    // (block-load total is derived at parse time as t_netcdf_read + t_seed_filter)
-    double t_netcdf_read        = 0.0;  // LoadMPASOData: NetCDF I/O + mesh topology build
-    double t_seed_filter        = 0.0;  // inBlock() scan over all broadcast seeds
+    // Initialization phase
+    double t_block_load         = 0.0;  // set_data: NetCDF read + seed filter
 
-    // ── Tracing phase (accumulated over all iexchange rounds) ─────────────────
-    double t_trace_compute      = 0.0;  // GenStreamLines / GenPathLines (RK4 integration)
-    double t_trace_enqueue      = 0.0;  // Segment build/packing + cp.enqueue()
-    double t_dequeue_local      = 0.0;  // deq_incoming_iexchange: local dequeue/receive work (no network)
-    double t_fill_incoming      = 0.0;  // cp.fill_incoming(): exposed wait/progress/completion
+    // Tracing phase (accumulated over all DIY iexchange loop iterations)
+    double t_trace_dequeue       = 0.0;  // dequeue particles already received by DIY
+    double t_trace_local_wall    = 0.0;  // local block tracing wall time, excluding dequeue
+    double t_trace_prepare       = 0.0;  // prepare per-particle arrays, hints, and launch batches
+    double t_trace_integrate_cpu = 0.0;  // pure CPU OSUFlow integration call time
+    double t_trace_integrate_gpu = 0.0;  // pure CUDA integration kernel time
+    double t_trace_postprocess   = 0.0;  // build segments, update cells/steps, classify exits
+    double t_trace_enqueue       = 0.0;  // enqueue outgoing particles to DIY
 
-    // ── Output phase ─────────────────────────────────────────────────────────
+    // Output phase
     double t_output_write       = 0.0;  // write_trajectory
 
-    // ── Work counters ─────────────────────────────────────────────────────────
-    int    n_iex_rounds         = 0;    // iexchange do-while iterations (for per-round averages)
+    // Work counters (useful for normalizing time and detecting load imbalance)
     int    n_seeds_initial      = 0;    // seeds assigned to this block at startup
     long   n_steps_total        = 0;    // total RK4 integration steps completed
     int    n_particles_received = 0;    // particles received from neighbor blocks
-    int    n_particles_sent     = 0;    // particles forwarded to neighbor blocks
 
-    // ── Memory measurements (analytical formula) ──────────────────────────────
-    size_t mem_grid_bytes       = 0;    // MPASOGrid: topology arrays + coordinates
+    // GPU-specific pipeline timing (zero on CPU-only runs)
+    double t_gpu_pipeline_wall     = 0.0;  // full GPU wrapper wall time, excluding ParaFlow postprocess
+    double t_gpu_host_prepare      = 0.0;  // host metadata packing / Solution flattening
+    double t_gpu_upload_topology   = 0.0;  // static MPAS-O topology upload
+    double t_gpu_upload_velocity   = 0.0;  // velocity / zTop / timestamp window upload
+    double t_gpu_alloc             = 0.0;  // per-launch CUDA allocations
+    double t_gpu_upload_particles  = 0.0;  // particle arrays H2D copies
+    double t_gpu_download_results  = 0.0;  // D2H result copies
+    double t_gpu_free              = 0.0;  // per-launch CUDA frees
+    double t_gpu_field_release     = 0.0;  // release uploaded topology/velocity buffers
+
+    // Cell counts (set at init, used to derive Block-owned index array sizes)
+    int    n_local_cells        = 0;    // number of cells owned by this block
+    int    n_global_cells       = 0;    // total cells in the global mesh
+
+    // Memory measurements (computed once at init, analytical formula)
+    size_t mem_grid_bytes       = 0;    // MPASOGrid topology + coordinates + Block index arrays
     size_t mem_solution_bytes   = 0;    // Solution: velocity field data (scales with timesteps)
 
-    // ── Memory measurements (OS-reported, from /proc/self/status) ────────────
+    // Memory measurements (OS-reported, from /proc/self/status)
     long   mem_vmrss_before_kb  = 0;    // VmRSS before set_data (kB)
     long   mem_vmrss_after_kb   = 0;    // VmRSS after  set_data (kB)
     long   mem_peak_vmhwm_kb    = 0;    // VmHWM peak after tracing (kB)
 };
 
-// Use clock_gettime(CLOCK_MONOTONIC) instead of MPI_Wtime().
-// On Linux this is a vDSO call (~3-10 ns) vs MPI_Wtime (~100-200 ns).
-// The difference matters when pf_now/pf_accum are called thousands of times
-// per block in tight iexchange loops — especially with small seed counts where
-// total compute time may be only a few milliseconds.
 inline double pf_now(bool enabled) {
-    if (!enabled) return 0.0;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    return enabled ? MPI_Wtime() : 0.0;
 }
 
 inline void pf_accum(double& acc, double start, bool enabled) {
-    if (!enabled) return;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    acc += ((double)ts.tv_sec + (double)ts.tv_nsec * 1e-9) - start;
+    if (enabled) acc += MPI_Wtime() - start;
 }
 
 inline long pf_read_vmrss_kb() {

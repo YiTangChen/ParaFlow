@@ -1457,6 +1457,8 @@ bool OSUFlow::GenStreamLines(list<vtListSeedTrace*>& listSeedTraces,
 	pStreamLine->SetMaxStepSize(maxStepSize);
 	pStreamLine->setIntegrationOrder(this->order);
 	pStreamLine->setSaveInterval(m_nSaveInterval);
+	pStreamLine->setPerSeedMaxPoints(m_vPerSeedMaxPoints);
+	m_vPerSeedMaxPoints.clear();  // one-shot: do not leak to later calls that don't set it
 	pStreamLine->execute((void *)&currentT, listSeedTraces, fromCells, toCells, mpaso_reader);
 	m_lastTraceStepCounts = pStreamLine->getTraceActualStepCounts();
 	// release resource

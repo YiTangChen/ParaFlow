@@ -40,6 +40,8 @@ sed -i 's|^CC=|# CC=|'                 "$BUILD"
 sed -i 's|^CXX=|# CXX=|'              "$BUILD"
 sed -i 's|^NETCDF_DIR=|# NETCDF_DIR=|'         "$BUILD"
 sed -i 's|^NETCDF_CXX_DIR=|# NETCDF_CXX_DIR=|' "$BUILD"
+sed -i 's|^CUDA_MODULE_|# CUDA_MODULE_|'                 "$BUILD"
+sed -i 's|^CUDA_ARCH_DEFAULT_|# CUDA_ARCH_DEFAULT_|'     "$BUILD"
 
 # Step 2: Uncomment the target machine's lines (matched by unique path prefix).
 case "$TARGET" in
@@ -48,18 +50,24 @@ case "$TARGET" in
         sed -i 's|^# \(CXX=/opt/cray/\)|\1|'   "$BUILD"
         sed -i 's|^# \(NETCDF_DIR=${NETCDF_DIR:-/opt/cray/\)|\1|'         "$BUILD"
         sed -i 's|^# \(NETCDF_CXX_DIR=${NETCDF_CXX_DIR:-/opt/cray/\)|\1|' "$BUILD"
+        sed -i 's|^# \(CUDA_MODULE_NERSC=\)|\1|'        "$BUILD"
+        sed -i 's|^# \(CUDA_ARCH_DEFAULT_NERSC=\)|\1|'  "$BUILD"
         ;;
     ascend)
         sed -i 's|^# \(CC=/apps/spack/0.21/ascend/\)|\1|'    "$BUILD"
         sed -i 's|^# \(CXX=/apps/spack/0.21/ascend/\)|\1|'   "$BUILD"
         sed -i 's|^# \(NETCDF_DIR=${NETCDF_DIR:-/apps/spack/0.21/ascend/\)|\1|'         "$BUILD"
         sed -i 's|^# \(NETCDF_CXX_DIR=${NETCDF_CXX_DIR:-/apps/spack/0.21/ascend/\)|\1|' "$BUILD"
+        sed -i 's|^# \(CUDA_MODULE_ASCEND=\)|\1|'        "$BUILD"
+        sed -i 's|^# \(CUDA_ARCH_DEFAULT_ASCEND=\)|\1|'  "$BUILD"
         ;;
     cardinal)
         sed -i 's|^# \(CC=/apps/spack/0.21/cardinal/\)|\1|'    "$BUILD"
         sed -i 's|^# \(CXX=/apps/spack/0.21/cardinal/\)|\1|'   "$BUILD"
         sed -i 's|^# \(NETCDF_DIR=${NETCDF_DIR:-/apps/spack/0.21/cardinal/\)|\1|'         "$BUILD"
         sed -i 's|^# \(NETCDF_CXX_DIR=${NETCDF_CXX_DIR:-/apps/spack/0.21/cardinal/\)|\1|' "$BUILD"
+        sed -i 's|^# \(CUDA_MODULE_CARDINAL=\)|\1|'        "$BUILD"
+        sed -i 's|^# \(CUDA_ARCH_DEFAULT_CARDINAL=\)|\1|'  "$BUILD"
         ;;
 esac
 

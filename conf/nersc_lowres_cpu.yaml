@@ -1,0 +1,66 @@
+enable_timing: true
+outputDir: pathlines/nersc_lowres_256_cpu
+
+maxsteps: null
+record_interval: 30
+dt: 60.0
+nproc: 256
+nblocks: 256
+meshfile_src: /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/ocean.EC30to60E2r2.210210.nc
+datafile_src: [/global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-01-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-02-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-03-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-04-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-05-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-06-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-07-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-08-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-09-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-10-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-11-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0001-12-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-01-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-02-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-03-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-04-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-05-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-06-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-07-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-08-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-09-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-10-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-11-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0002-12-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-01-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-02-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-03-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-04-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-05-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-06-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-07-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-08-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-09-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-10-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-11-01.nc,
+                /global/cfs/cdirs/m4259/yqiu/MOPS_ab/climatology/LowRes_0001-0010_climatology.0003-12-01.nc]
+graph_partition_indices: partition/lowres_20y.info.part.256
+isBinarySeed: true
+seedFile: seeds/random_seeds_10k.bin
+
+# time-varying variables
+isTimeVarying: true
+loadNTimeSteps: 16
+velocity:
+  cartesian:
+    X: null
+    Y: null
+    Z: null
+  spherical:
+    zonal: null
+    meridional: null
+  normal: timeMonthly_avg_normalVelocity
+zTop: null
+layerThickness: timeMonthly_avg_layerThickness
+vertVelocityTop: timeMonthly_avg_vertVelocityTop
+xtime: xtime_startMonthly
+useGPU: false

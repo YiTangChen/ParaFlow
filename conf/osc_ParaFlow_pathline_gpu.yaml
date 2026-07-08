@@ -1,0 +1,36 @@
+enable_timing: true
+outputDir: pathlines/osc_lowres
+
+maxsteps: null
+record_interval: 30
+dt: 60.0
+nproc: 16
+nblocks: 16
+meshfile_src: null
+datafile_src: [/fs/scratch/PAS0027/yitang/MPASO_data/output.nc, 
+              /fs/scratch/PAS0027/yitang/MPASO_data/output_1.nc,
+              /fs/scratch/PAS0027/yitang/MPASO_data/output_2.nc,
+              /fs/scratch/PAS0027/yitang/MPASO_data/output_3.nc,
+              /fs/scratch/PAS0027/yitang/MPASO_data/output_4.nc,
+              /fs/scratch/PAS0027/yitang/MPASO_data/output_5.nc]
+graph_partition_indices: nc2graph.info.part.16
+isBinarySeed: true
+seedFile: seeds/random_seeds.bin
+
+# time-varying variables
+isTimeVarying: true
+loadNTimeSteps: 16
+velocity:
+  cartesian:     # XYZ
+    X: null
+    Y: null
+    Z: null
+  spherical:    # zonal & meridional
+    zonal: null
+    meridional: null
+  normal: normalVelocity   # normal
+zTop: null
+layerThickness: layerThickness
+vertVelocityTop: vertVelocityTop
+xtime: xtime
+useGPU: true

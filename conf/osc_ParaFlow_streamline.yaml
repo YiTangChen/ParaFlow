@@ -1,5 +1,5 @@
 enable_timing: true
-outputDir: streamlines/testMem
+outputDir: streamlines/osc_lowres
 
 maxsteps: 1000000
 record_interval: 180
@@ -10,7 +10,7 @@ meshfile_src: null
 datafile_src: /fs/scratch/PAS0027/yitang/MPASO_data/output.nc
 graph_partition_indices: nc2graph.info.part.256
 isBinarySeed: true
-seedFile: seeds/random_seeds_100.bin
+seedFile: seeds/random_seeds.bin
 
 # time-varying variables
 isTimeVarying: false

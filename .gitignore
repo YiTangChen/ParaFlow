@@ -5,7 +5,6 @@ Thumbs.db
 *.swp
 *.swo
 **/.ipynb_checkpoints/
-**/*~
 
 # CMake / build artifacts
 **/CMakeFiles/
@@ -33,21 +32,23 @@ Thumbs.db
 /streamlines/
 /pathlines/
 /logs/
-/results/
 /block_outputs/
+/output/
 /seeds/
 /results/
-/conf/
+/NERSC_job/
+/partition/
+rendering/render_log_*.txt
+/LIC/
+/debug/
 
 # Generated figures
 *.png
 *.pdf
 *.log
 *.csv
-
-# Generated files
+*.webm
 *.bin
-slurm-*.out
 
 # Graph partition files
 *.info.part.*

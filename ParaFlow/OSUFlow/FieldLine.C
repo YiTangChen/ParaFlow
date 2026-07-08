@@ -29,7 +29,9 @@ m_nMaxsize(MAX_LENGTH),
 m_nSaveInterval(1),
 m_lastFieldLineStepCount(0),
 m_fInitStepSize(1.0),
-m_pField(pField)
+m_pField(pField),
+m_mpasoRK4AuditHook(NULL),
+m_mpasoRK4AuditUserData(NULL)
 {
 }
 
@@ -54,8 +56,36 @@ void vtCFieldLine::releaseSeedMemory(void)
 	m_nNumSeeds = 0;
 }
 
+void vtCFieldLine::SetMPASORK4AuditHook(MPASORK4AuditHook hook, void* userData)
+{
+	m_mpasoRK4AuditHook = hook;
+	m_mpasoRK4AuditUserData = userData;
+}
+
+void vtCFieldLine::RecordMPASORK4AuditStage(int stage,
+											const VECTOR3& samplePoint,
+											double sampleTime,
+											int fromCell,
+											const PointInfo& pointInfo,
+											int status,
+											const VECTOR4& velocity) const
+{
+	if (m_mpasoRK4AuditHook == NULL)
+		return;
+
+	MPASORK4AuditRecord record;
+	record.stage = stage;
+	record.samplePoint = samplePoint;
+	record.sampleTime = sampleTime;
+	record.fromCell = fromCell;
+	record.inCell = pointInfo.inCell;
+	record.status = status;
+	record.velocity = velocity;
+	m_mpasoRK4AuditHook(m_mpasoRK4AuditUserData, record);
+}
+
 //////////////////////////////////////////////////////////////////////////
-// Integrate along a field line using the 2nd order Euler-Cauchy 
+// Integrate along a field line using the 2nd order Euler-Cauchy
 // predictor-corrector method. This routine is used for both steady and
 // unsteady vector fields. 
 //////////////////////////////////////////////////////////////////////////
@@ -251,7 +281,6 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 							   double dt,
 							   int* cachedLowT)
 {
-	const double speedup = 100.0;
 	int istat;
 	VECTOR4 vel;
 
@@ -259,9 +288,11 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 	double  r0  = pt0.GetMag();
 	if (r0 <= 0.0) return OUT_OF_BOUND;
 
-	// --- Stage 1: evaluate k1 at (pt0, t) and cap dt ---
+	// --- Stage 1: evaluate k1 at (pt0, t) ---
 	PointInfo ci_tmp = ci;
+	vel.Zero();
 	istat = m_pField->at_phys(ci.inCell, pt0, ci_tmp, *t, vel, cachedLowT);
+	RecordMPASORK4AuditStage(1, pt0, *t, ci.inCell, ci_tmp, istat, vel);
 	if (istat != 1) return OUT_OF_BOUND;
 
 	VECTOR3 k1_h(vel[0], vel[1], vel[2]);
@@ -273,7 +304,9 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 	if (!geodesic_step(time_dir, pt0, r0, k1_h, k1_v, 0.5 * dt, pt1, r1)) return OUT_OF_BOUND;
 	double t1 = (time_dep == UNSTEADY) ? *t + 0.5 * time_dir * dt : *t;
 	ci_tmp = ci; ci_tmp.phyCoord = pt1;
+	vel.Zero();
 	istat = m_pField->at_phys(cell0, pt1, ci_tmp, t1, vel, cachedLowT);
+	RecordMPASORK4AuditStage(2, pt1, t1, cell0, ci_tmp, istat, vel);
 	if (istat != 1) { ci.phyCoord = pt1; return OUT_OF_BOUND; }
 	VECTOR3 k2_h(vel[0], vel[1], vel[2]);
 	double  k2_v = vel[3];
@@ -282,7 +315,9 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 	VECTOR3 pt2; double r2;
 	if (!geodesic_step(time_dir, pt0, r0, k2_h, k2_v, 0.5 * dt, pt2, r2)) return OUT_OF_BOUND;
 	ci_tmp = ci; ci_tmp.phyCoord = pt2;
+	vel.Zero();
 	istat = m_pField->at_phys(cell0, pt2, ci_tmp, t1, vel, cachedLowT);
+	RecordMPASORK4AuditStage(3, pt2, t1, cell0, ci_tmp, istat, vel);
 	if (istat != 1) { ci.phyCoord = pt2; return OUT_OF_BOUND; }
 	VECTOR3 k3_h(vel[0], vel[1], vel[2]);
 	double  k3_v = vel[3];
@@ -292,7 +327,9 @@ int vtCFieldLine::MPASO_rk4(TIME_DIR time_dir,
 	if (!geodesic_step(time_dir, pt0, r0, k3_h, k3_v, dt, pt3, r3)) return OUT_OF_BOUND;
 	double t2 = (time_dep == UNSTEADY) ? *t + time_dir * dt : *t;
 	ci_tmp = ci; ci_tmp.phyCoord = pt3;
+	vel.Zero();
 	istat = m_pField->at_phys(cell0, pt3, ci_tmp, t2, vel, cachedLowT);
+	RecordMPASORK4AuditStage(4, pt3, t2, cell0, ci_tmp, istat, vel);
 	if (istat != 1) { ci.phyCoord = pt3; return OUT_OF_BOUND; }
 	VECTOR3 k4_h(vel[0], vel[1], vel[2]);
 	double  k4_v = vel[3];

@@ -52,10 +52,14 @@ private:
     void deq_incoming_iexchange(Block* b, const diy::Master::ProxyWithLink& cp);
     void trace_block(Block*                             b,
                     const diy::Master::ProxyWithLink&   cp);
+    void trace_block_gpu(Block*                         b,
+                    const diy::Master::ProxyWithLink&   cp);
     bool trace_block_iexchange(Block*                                b,
                                 const diy::Master::ProxyWithLink&    cp);
     void trace_block_pathline(Block*                            b,
                               const diy::Master::ProxyWithLink& cp);
+    void trace_block_pathline_gpu(Block*                        b,
+                                  const diy::Master::ProxyWithLink& cp);
     bool trace_block_pathline_iexchange(Block*                               b,
                                         const diy::Master::ProxyWithLink&    cp);
 
@@ -72,6 +76,7 @@ private:
     int                       domain_x, domain_y, domain_z;
     bool                      isTimeVarying;
     bool                      enable_timing = false; // controlled by YAML enable_timing key
+    bool                      useGPU = false;        // YAML useGPU, resolved against runtime availability
     SeedReadMode              seedReadMode = SeedReadMode::NONDEF;
     std::vector<std::string>  vectorFiles;
     std::string               meshFile;
