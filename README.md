@@ -1,43 +1,60 @@
 # ParaFlow
 
-ParaFlow is a parallel particle-tracing / flow-visualization code for **MPAS-Ocean** data.
-It generates **streamlines** and **pathlines** over an unstructured ocean mesh using:
+ParaFlow is a distributed particle-tracing engine for **MPAS-Ocean** model output.
+It integrates **streamlines** and **pathlines** through the time-varying velocity
+field of an unstructured global-ocean mesh, scaling across nodes with MPI.
 
-- **MPI + DIY** for block-parallel domain decomposition,
-- **OSUFlow** for the field-line integrators (RK4), with an **optional CUDA GPU backend**,
-- **yaml-cpp** for run configuration.
+**Architecture**
+- **MPI + [DIY](https://github.com/diatomic/diy)** — block-parallel decomposition, one mesh partition per rank.
+- **OSUFlow** — RK4 field-line integration, with an optional **CUDA** backend.
 
-It runs on HPC clusters (NERSC Perlmutter, OSC ascend/cardinal) under Slurm via `srun`.
+The CUDA tracing kernels are factored into a standalone submodule,
+**[mpaso-gpu-kernels](https://github.com/Jiaxin-yyjx/mpaso-gpu-kernels)** — a
+framework-agnostic (plain-array) core shared with the MOPS project. ParaFlow adds a thin host uploader (`MPASOGPUTracer`) that flattens its OSUFlow mesh into that core.
 
-## Repository layout
+## Execution modes
 
-```
-ParaFlow/                     ← repo root
-├─ ParaFlow_streamline.cpp    ← thin driver → GenStreamLines()
-├─ ParaFlow_pathline.cpp      ← thin driver → GenPathLines()
-├─ DrawSubdomain.cpp          ← driver: generates the subdomain / ocean-mask data
-├─ CMakeLists.txt             ← top-level build
-├─ build.sh / clean.sh / switch.sh   ← build + machine-select (run from root)
-│
-├─ ParaFlow/                  ← core library (libParaFlow.a)
-│  ├─ ParaFlow.cpp / .hpp     ←   main tracing logic + config parsing
-│  ├─ block.hpp               ←   DIY block definition
-│  ├─ timing.hpp / utils.hpp  ←   instrumentation + helpers
-│  ├─ OSUFlow/                ←   vendored flow library (CPU + GPU/CUDA integrators)
-│  ├─ diy/                    ←   git submodule (block-parallel framework)
-│  └─ yaml-cpp/               ←   vendored config parser
-│
-├─ scripts/                   ← Python tooling (run from repo root)
-│  ├─ setup/                  ←   gen_random_seeds, gen_partition, check_atlantic_seeds
-│  ├─ plot/                   ←   read_traces, plot_*, drawsubdomain, convert_traces_to_vtk
-│  └─ profiling/              ←   parse_timing, plot_timing, parse_mem
-├─ jobs/                      ← Slurm launch scripts (nersc_*, osc_run.sh, plot_traces.sh)
-├─ conf/                      ← YAML run configs (see naming below)
-└─ rendering/ , LIC/          ← visualization / line-integral-convolution
-```
+ParaFlow support two build modes. The CUDA build additionally selects CPU vs GPU per run via `useGPU`.
 
-> Python and job scripts use **CWD-relative** paths — always run them from the repo
-> root (e.g. `python3 scripts/plot/plot_traces.py ...`), not from inside their folder.
+| Mode | Build | `useGPU` | Tracing |
+|------|-------|----------|---------|
+| **CPU** | `./build.sh` | `false` | RK4 on CPU cores |
+| **CPU + GPU** | `OSUFLOW_ENABLE_CUDA=1 ./build.sh` | `true` | RK4 on GPU (auto-fallback to CPU if no device) |
+
+Runs use **one block per rank**: keep `nproc == nblocks ==` the partition's `part.N`,
+and launch with `srun -n N`.
+
+## Requirements
+
+MPI (Cray MPICH / MVAPICH) · CMake ≥ 3.18 · C++17 · NetCDF-C / NetCDF-C++ ·
+CUDA ≥ 11 (GPU mode only).
+
+## Quick start
+
+ParaFlow has **two submodules** (`diy`, `mpaso-gpu-kernels`), so clone recursively:
+
+    git clone --recurse-submodules git@github.com:YiTangChen/ParaFlow.git
+    cd ParaFlow
+    # cloned flat already?  
+    ->  git submodule update --init --recursive
+
+The `mpaso-gpu-kernels` submodule is compiled only in the CUDA build.
+
+<!-- ## Running
+
+    # 1 · seeds + output folders  (default 10000)
+    python3 scripts/setup/gen_random_seeds.py [N]
+
+    # 2 · subdomain / ocean mask  (once; used for masking + plots)
+    srun -n N ./DrawSubdomain conf/<machine>_<res>_drawsubdomain.yaml
+
+    # 3 · trace  (N must equal the config's nproc)
+    srun -n N ./ParaFlow_streamline conf/<cfg>.yaml
+    srun -n N ./ParaFlow_pathline   conf/<cfg>.yaml
+
+    # 4 · reassemble ranks + render on the ocean mask
+    jobs/plot_traces.sh -->
+
 
 ## Main setup flow
 
@@ -97,7 +114,7 @@ OSUFLOW_ENABLE_CUDA=1 ./build.sh
 ### 5. Generate the subdomain output
 
 ```bash
-srun -n 256 -N 12 --ntasks-per-node=24 --distribution=block:cyclic ./DrawSubdomain conf/osc_drawsubdomain.yaml
+srun -n N ./DrawSubdomain conf/<machine>_<res>_drawsubdomain.yaml
 ```
 
 ### 6. Plot the subdomain
@@ -108,77 +125,25 @@ python3 scripts/plot/drawsubdomain.py
 
 After steps 1-6 are done, the project is ready for the trace runs below.
 
-## Optional runs
+## Run a trace
 
-The following parts do not need to follow a strict global order.
+Once setup (steps 1–6) is done, trace **streamlines** or **pathlines** — they are
+independent, so run either or both. Match `srun -n N` to the config's `nproc`
+(= `nblocks` = the partition's `part.N`):
 
-- `7` and `8` belong together for the streamline workflow.
-- `9` and `10` belong together for the pathline workflow.
-- You can run either workflow depending on what you want to generate.
+​```bash
+srun -n N ./ParaFlow_streamline conf/<cfg>.yaml   # streamlines
+srun -n N ./ParaFlow_pathline   conf/<cfg>.yaml   # pathlines
+​```
 
-## Streamline workflow
+On NERSC, submit the batch scripts instead — e.g. `sbatch jobs/nersc_lowres_gpu.sh`
+(each pairs with its like-named `conf/` file).
 
-### 7. Run streamline tracing
+## Plot
 
-```bash
-srun -n 256 -N 12 --ntasks-per-node=24 --distribution=block:cyclic ./ParaFlow_streamline conf/osc_ParaFlow_streamline.yaml
-```
+​```bash
+jobs/plot_traces.sh   # reassemble per-rank output + render it on the ocean mask
+​```
 
-### 8. Plot streamline results
-
-```bash
-jobs/plot_traces.sh
-```
-
-## Pathline workflow
-
-### 9. Run pathline tracing
-
-```bash
-srun -n 256 -N 12 --ntasks-per-node=24 --distribution=block:cyclic ./ParaFlow_pathline conf/osc_ParaFlow_pathline.yaml
-```
-
-### 10. Plot pathline results
-
-```bash
-jobs/plot_traces.sh
-```
-
-## Note
-
-`jobs/plot_traces.sh` currently uses the pathline plotting command by default.
-
-If you want to plot streamlines instead, edit `jobs/plot_traces.sh`, uncomment the first two lines below, and comment out the last line:
-
-```bash
-# python3 scripts/plot/read_traces.py 256 streamlines
-# python3 scripts/plot/plot_traces.py streamlines/streamlines.bin drawSubdomain streamlines_map.png
-
-# python3 scripts/plot/read_traces.py 256 pathlines
-python3 scripts/plot/plot_traces.py pathlines/pathlines.bin drawSubdomain pathlines_map.png
-```
-
-## Config naming (`conf/`)
-
-- **NERSC** (canonical, 256 ranks): `nersc_{highres,lowres}_{cpu,gpu}.yaml` (pathline) +
-  `nersc_{highres,lowres}_drawsubdomain.yaml`. highres = `18to6v3` 3.7M-cell mesh;
-  lowres = `LowRes` climatology mesh; `gpu` sets `useGPU: true`.
-- **OSC:** `osc_ParaFlow_{pathline,streamline}[_gpu].yaml`, `osc_drawsubdomain.yaml`.
-- Each NERSC job script pairs with its like-named config
-  (`jobs/nersc_highres_cpu.sh` → `conf/nersc_highres_cpu.yaml`).
-
-## Clone with submodules
-
-This repository uses `ParaFlow/diy` as a git submodule.
-
-When cloning the repository for the first time, use:
-
-```bash
-git clone --recurse-submodules git@github.com:YiTangChen/ParaFlow.git
-```
-
-If you already cloned the repository without submodules, run:
-
-```bash
-git submodule update --init --recursive
-```
+`plot_traces.sh` plots **pathlines** by default; to plot **streamlines**, swap the two
+commented lines at the top of the script (point it at `streamlines/` instead of `pathlines/`).
