@@ -8,6 +8,7 @@ Section A — single-run diagnostics (one (n_blocks, n_seeds) config):
   A2  Load imbalance sorted
   A3  RK4 steps per block
   A4  Phase Gantt (approximate timeline)
+  A5  Imbalance diagnosis: work distribution + work-vs-throughput scatter
 
 Section B — scaling analysis (varies n_blocks, same device):
   B1  Strong scaling wall-clock time
@@ -206,8 +207,47 @@ def plot_per_run(df_blocks, n_blocks, n_seeds, run_id, device, mesh):
     ax.grid(axis="x", alpha=0.3)
     save(fig, f"{tag}_A4_gantt_timeline.png")
 
+    # ── A5: Imbalance diagnosis — work distribution + work-vs-throughput ───────
+    # The scatter is the key: a tight line ⇒ throughput is uniform, so imbalance is
+    # pure work distribution (fixable by weighting the partition by predicted steps).
+    # A cloud ⇒ throughput varies ⇒ hardware (NUMA / GPU contention), a different fix.
+    steps = df.n_steps_total.astype(float).values
+    walls = df.t_trace_local_wall.astype(float).values
+    ok    = walls > 0
+    tput  = np.zeros_like(steps)
+    tput[ok] = steps[ok] / walls[ok] / 1e6                 # M steps/s
+    work_avg = steps.mean() if len(steps) else 0.0
+    work_moa = (steps.max() / work_avg) if work_avg > 0 else 0.0
+    tmean = tput[ok].mean() if ok.any() else 0.0
+    tcov  = (tput[ok].std() / tmean) if tmean > 0 else 0.0
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 4.5))
+    order = np.argsort(-steps)
+    axL.bar(range(n), steps[order] / 1e6, color=C_COMPUTE, zorder=3)
+    axL.axhline(work_avg / 1e6, color="red", ls="--", lw=1.4, label=f"avg = {work_avg/1e6:.2f} M")
+    axL.set_xlabel("Block (sorted by work)")
+    axL.set_ylabel("RK4 steps (millions)")
+    axL.set_title(f"Work distribution — max/avg = {work_moa:.2f}×")
+    axL.legend(); axL.grid(axis="y", alpha=0.3, zorder=0)
+
+    axR.scatter(steps / 1e6, walls, s=40, color=C_COMPUTE, zorder=3)
+    if tmean > 0:
+        xs = np.array([0.0, steps.max() / 1e6])
+        axR.plot(xs, xs / tmean, color=C_IDEAL, ls="--", lw=1.3,
+                 label=f"uniform throughput ({tmean:.1f} M steps/s)")
+    axR.set_xlabel("Work (M steps)")
+    axR.set_ylabel("trace_local_wall (s)")
+    verdict = ("work-bound → re-partition by predicted steps"
+               if tcov < 0.15 else "throughput varies → check NUMA / GPU contention")
+    axR.set_title(f"Work vs time — throughput CoV = {tcov:.2f}\n{verdict}")
+    axR.legend(fontsize=8); axR.grid(alpha=0.3, zorder=0)
+
+    fig.suptitle(f"Imbalance Diagnosis — {title}")
+    plt.tight_layout()
+    save(fig, f"{tag}_A5_imbalance_diagnosis.png")
+
     print(f"  → imbalance  max/avg = {imb_ma:.2f}×   max/min = {imb_mm:.2f}×  "
-          f"  hottest = gid {int(hot.gid)}")
+          f"  hottest = gid {int(hot.gid)}  throughput_CoV = {tcov:.2f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -466,11 +506,17 @@ def plot_gpu_vs_cpu(valid, blocks):
 
     have_ref = len(cpu_ref) > 0 and len(gpu_ref) > 0
 
+    # End-to-end driver wall (block_load + exchange + write) if available,
+    # else fall back to the exchange-only wall from older CSVs.
+    def _wall(row):
+        r = float(row.get("t_run_max", 0) or 0)
+        return r if r > 0 else float(row["t_iex_max"])
+
     # ── C1: Wall-clock time bar chart ─────────────────────────────────────────
     # Compare all runs grouped by device, at 16 blocks / 10k seeds
     if have_ref:
-        cpu_wall = float(cpu_ref.iloc[0]["t_iex_max"])
-        gpu_wall = float(gpu_ref.iloc[0]["t_iex_max"])
+        cpu_wall = _wall(cpu_ref.iloc[0])
+        gpu_wall = _wall(gpu_ref.iloc[0])
         speedup  = cpu_wall / gpu_wall
 
         fig, ax = plt.subplots(figsize=(6, 5))
@@ -481,43 +527,70 @@ def plot_gpu_vs_cpu(valid, blocks):
             ax.text(bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + 0.2,
                     f"{val/3600:.1f} h", ha="center", va="bottom", fontsize=11, fontweight="bold")
-        ax.set_ylabel("Wall-clock time (hours)")
+        ax.set_ylabel("End-to-end wall time (hours)")
         ax.set_title(
-            f"Wall-Clock Time: CPU vs GPU\n"
+            f"End-to-End Wall Time: CPU vs GPU\n"
             f"(lowres · 16 blocks · 10,000 seeds · GPU speedup = {speedup:.1f}×)"
         )
         ax.grid(axis="y", alpha=0.3)
         save(fig, "C1_wall_time_cpu_vs_gpu.png")
         print(f"  [C1] CPU={cpu_wall/3600:.2f} h  GPU={gpu_wall/3600:.2f} h  speedup={speedup:.1f}×")
 
-    # ── C2: Phase breakdown comparison ────────────────────────────────────────
+    # ── C2: Aligned phase breakdown, CPU vs GPU ───────────────────────────────
+    # Both devices decompose into the SAME buckets so the bars are directly
+    # comparable. transfer is 0 on CPU by construction; integrate is the unified
+    # cpu+gpu bucket. Left panel = end-to-end (block_load dominates); right panel
+    # = trace-only buckets zoomed in, to expose where the GPU win is spent.
     if have_ref:
         cpu_row = cpu_ref.iloc[0]
         gpu_row = gpu_ref.iloc[0]
 
-        phases = ["t_blockload_avg", "t_compute_avg", "t_write_avg", "t_idle_avg"]
-        labels = ["Block load", "Compute", "Write", "Idle"]
-        colors = [C_LOAD, C_COMPUTE, C_WRITE, C_IDLE]
+        def g(row, col):
+            try:
+                return float(row.get(col, 0.0) or 0.0)
+            except Exception:
+                return 0.0
 
-        cpu_vals = [float(cpu_row[p]) / 3600 for p in phases]
-        gpu_vals = [float(gpu_row[p]) / 3600 for p in phases]
+        trace_phases = [
+            ("t_prepare_avg",     "Prepare (host setup)", "#8E24AA"),
+            ("t_transfer_avg",    "Transfer (H2D/D2H)",   C_KERNEL),
+            ("t_integrate_avg",   "Integrate",            C_COMPUTE),
+            ("t_postprocess_avg", "Postprocess",          "#00897B"),
+            ("t_enqueue_avg",     "Enqueue (MPI)",        "#546E7A"),
+        ]
+        e2e_phases = [("t_blockload_avg", "Block load", C_LOAD)] + trace_phases \
+                     + [("t_output_write_avg", "Write", C_WRITE)]
 
-        x = np.arange(2)
-        fig, ax = plt.subplots(figsize=(7, 5))
-        bottoms_cpu = np.zeros(1)
-        bottoms_gpu = np.zeros(1)
-        for label, color, cv, gv in zip(labels, colors, cpu_vals, gpu_vals):
-            ax.bar([0], [cv], bottom=bottoms_cpu, color=color, label=label, width=0.4)
-            ax.bar([1], [gv], bottom=bottoms_gpu, color=color, width=0.4, alpha=0.85)
-            bottoms_cpu = bottoms_cpu + cv
-            bottoms_gpu = bottoms_gpu + gv
+        fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
 
-        ax.set_xticks([0, 1])
-        ax.set_xticklabels(["CPU", "GPU"])
-        ax.set_ylabel("Avg time per rank (hours)")
-        ax.set_title("Phase Breakdown: CPU vs GPU\n(lowres · 16 blocks · 10,000 seeds)")
-        ax.legend(loc="upper right", fontsize=9)
-        ax.grid(axis="y", alpha=0.3)
+        # Left: end-to-end (seconds)
+        bc, bg = 0.0, 0.0
+        for col, label, color in e2e_phases:
+            cv, gv = g(cpu_row, col), g(gpu_row, col)
+            axL.bar([0], [cv], bottom=[bc], color=color, label=label, width=0.45)
+            axL.bar([1], [gv], bottom=[bg], color=color, width=0.45, alpha=0.85)
+            bc += cv; bg += gv
+        axL.set_xticks([0, 1]); axL.set_xticklabels(["CPU", "GPU"])
+        axL.set_ylabel("Avg time per rank (s)")
+        axL.set_title("End-to-end (block_load dominates)")
+        axL.legend(loc="upper right", fontsize=8)
+        axL.grid(axis="y", alpha=0.3)
+
+        # Right: trace-only buckets, zoomed
+        bc, bg = 0.0, 0.0
+        for col, label, color in trace_phases:
+            cv, gv = g(cpu_row, col), g(gpu_row, col)
+            axR.bar([0], [cv], bottom=[bc], color=color, label=label, width=0.45)
+            axR.bar([1], [gv], bottom=[bg], color=color, width=0.45, alpha=0.85)
+            bc += cv; bg += gv
+        axR.set_xticks([0, 1]); axR.set_xticklabels(["CPU", "GPU"])
+        axR.set_ylabel("Avg time per rank (s)")
+        axR.set_title("Trace buckets only (aligned)")
+        axR.legend(loc="upper right", fontsize=8)
+        axR.grid(axis="y", alpha=0.3)
+
+        fig.suptitle("Aligned Phase Breakdown: CPU vs GPU  (lowres · 16 blocks · 10,000 seeds)")
+        plt.tight_layout()
         save(fig, "C2_phase_breakdown_cpu_vs_gpu.png")
 
     # ── C3: GPU speedup bar (overall + compute-only) ──────────────────────────

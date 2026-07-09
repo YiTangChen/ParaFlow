@@ -73,7 +73,6 @@ GPUBlockContext* CreateGPUBlockContext(MPASOGrid* grid,
     if (grid == nullptr) return nullptr;
 
     const bool collect_timing = (timing_out != nullptr);
-    auto t_pipeline = collect_timing ? gpu_timer_now() : Clock::time_point{};
     auto t_host_prepare = collect_timing ? gpu_timer_now() : Clock::time_point{};
 
     GPUBlockContext* context = new GPUBlockContext;
@@ -105,7 +104,6 @@ GPUBlockContext* CreateGPUBlockContext(MPASOGrid* grid,
 
     if (timing_out) {
         timing_out->upload_topology_ms += gpu_timer_ms_since(t_upload_topology);
-        timing_out->pipeline_wall_ms += gpu_timer_ms_since(t_pipeline);
     }
     return context;
 }
@@ -121,7 +119,6 @@ void UploadGPUVelocityWindow(GPUBlockContext* context,
     if (!context->topology_uploaded) return;
 
     const bool collect_timing = (timing_out != nullptr);
-    auto t_pipeline = collect_timing ? gpu_timer_now() : Clock::time_point{};
     auto t_host_prepare = collect_timing ? gpu_timer_now() : Clock::time_point{};
 
     MPASODeviceField& field = context->field;
@@ -147,7 +144,6 @@ void UploadGPUVelocityWindow(GPUBlockContext* context,
 
     if (timing_out) {
         timing_out->upload_velocity_ms += gpu_timer_ms_since(t_upload_velocity);
-        timing_out->pipeline_wall_ms += gpu_timer_ms_since(t_pipeline);
     }
 }
 
@@ -173,7 +169,6 @@ void TraceParticlesOnGPUContext(GPUBlockContext* context,
     if (context == nullptr || n_particles <= 0 || n_steps <= 0) return;
 
     const bool collect_timing = (timing_out != nullptr) || (kernel_ms_out != nullptr);
-    auto t_pipeline = collect_timing ? gpu_timer_now() : Clock::time_point{};
     float kernel_ms = 0.0f;
     mpaso_gpu::LaunchTracer(
         context->field,
@@ -199,7 +194,6 @@ void TraceParticlesOnGPUContext(GPUBlockContext* context,
         timing_out ? &timing_out->free_ms : nullptr);
     if (timing_out) {
         timing_out->kernel_ms += kernel_ms;
-        timing_out->pipeline_wall_ms += gpu_timer_ms_since(t_pipeline);
     }
     if (kernel_ms_out) *kernel_ms_out += kernel_ms;
 }
@@ -225,7 +219,6 @@ void TracePathlineBatchOnGPUContext(GPUBlockContext* context,
     if (context == nullptr || n_particles <= 0 || n_steps <= 0) return;
 
     const bool collect_timing = (timing_out != nullptr) || (kernel_ms_out != nullptr);
-    auto t_pipeline = collect_timing ? gpu_timer_now() : Clock::time_point{};
     float kernel_ms = 0.0f;
     mpaso_gpu::LaunchPathlineTracer(
         context->field,
@@ -250,7 +243,6 @@ void TracePathlineBatchOnGPUContext(GPUBlockContext* context,
         timing_out ? &timing_out->free_ms : nullptr);
     if (timing_out) {
         timing_out->kernel_ms += kernel_ms;
-        timing_out->pipeline_wall_ms += gpu_timer_ms_since(t_pipeline);
     }
     if (kernel_ms_out) *kernel_ms_out += kernel_ms;
 }
@@ -260,12 +252,10 @@ void DestroyGPUBlockContext(GPUBlockContext* context,
 {
     if (context == nullptr) return;
     const bool collect_timing = (timing_out != nullptr);
-    auto t_pipeline = collect_timing ? gpu_timer_now() : Clock::time_point{};
     auto t_release = collect_timing ? gpu_timer_now() : Clock::time_point{};
     context->field.release();
     if (timing_out) {
         timing_out->field_release_ms += gpu_timer_ms_since(t_release);
-        timing_out->pipeline_wall_ms += gpu_timer_ms_since(t_pipeline);
     }
     delete context;
 }

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <fstream>
 #include <OSUFlow.h>
+#include <LoadTiming.h>
 #include <diy/master.hpp>
 #include "utils.hpp"
 #include "timing.hpp"
@@ -107,6 +108,8 @@ struct Block
         startPts.reserve(allseeds.size());
         fromCells.reserve(allseeds.size());
 
+        load_timing::clock::time_point _t_sf;
+        if (load_timing::g.enabled) _t_sf = load_timing::tic();
         int seedCnt = 0;
         int checkpt = (allseeds.size() >= 10) ? (int)(allseeds.size() / 10) : 0;
         for (auto& seed : allseeds) {
@@ -138,6 +141,7 @@ struct Block
                 std::cerr << "[Block::set_data] gid: " << gid << ", processed " << seedCnt << "/" << allseeds.size() << " seeds" << std::endl;
             }
         }
+        if (load_timing::g.enabled) load_timing::g.seed_filter_s += load_timing::toc(_t_sf);
 
         this->setStartPtsDone();
     }

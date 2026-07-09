@@ -4,6 +4,7 @@
 #include "OSUFlow.h"
 #include "Plot3DReader.h" //added by lijie
 #include "MPASOReader.h"
+#include "LoadTiming.h"
 
 
 #pragma warning(disable : 4251 4100 4244 4101)
@@ -1331,6 +1332,8 @@ void OSUFlow::InitMPASOFlowField(int areaId, int nTotalCell, int* areaIndices, s
 	else
 		mpaso_reader = new MPASOReader(this->meshName, this->flowName, areaId, nTotalCell, areaIndices, cfg);
 
+	load_timing::clock::time_point _t_grid;
+	if (load_timing::g.enabled) _t_grid = load_timing::tic();
 	MPASOGrid* grid;
 	grid = mpaso_reader->CreateMPASOGrid();
 	std::cout << "[OSUFlow::InitMPASOFlowField]: Created MPASOGrid. for areaId = " << areaId << std::endl;
@@ -1338,7 +1341,8 @@ void OSUFlow::InitMPASOFlowField(int areaId, int nTotalCell, int* areaIndices, s
 	mpaso_reader->GetLocalCell2GlobalCell(LC2GC, nLC);
 	mpaso_reader->GetGlobalCell2LocalCell(GC2LC, nGC);
 	std::cout << "[OSUFlow::InitMPASOFlowField]: Global to Local Cell mapping retrieved." << std::endl;
-	
+	if (load_timing::g.enabled) load_timing::g.grid_build_s += load_timing::toc(_t_grid);
+
 	Solution *pSolution = nullptr;
 	Solution *vSolution = nullptr;
 	mpaso_reader->InitSolutions(grid, pSolution, vSolution);

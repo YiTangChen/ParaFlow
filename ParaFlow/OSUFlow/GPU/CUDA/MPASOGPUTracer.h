@@ -19,7 +19,6 @@ namespace mpaso_gpu_host {
 struct GPUBlockContext;
 
 struct GPUTimingBreakdown {
-    float pipeline_wall_ms    = 0.0f;  // full wrapper wall time, excluding ParaFlow postprocess
     float host_prepare_ms     = 0.0f;  // host metadata packing / Solution flattening
     float upload_topology_ms  = 0.0f;  // block-local static mesh upload
     float upload_velocity_ms  = 0.0f;  // velocity / zTop / timestamp window upload

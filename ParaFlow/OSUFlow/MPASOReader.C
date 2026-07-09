@@ -1,6 +1,10 @@
 #include "MPASOReader.h"
+#include "LoadTiming.h"
 #include <cmath>
 #include <cstring>
+
+// Single definition of the block_load sub-phase accumulator (see LoadTiming.h).
+namespace load_timing { Breakdown g; }
 
 // Chunked I/O helper: pick how many cells (or edges) to read per nc_get_vara_double
 // call so that the transient tmp buffer never exceeds TARGET_CHUNK_BYTES (1 GB).
@@ -300,6 +304,8 @@ void MPASOReader::loadGlobalTimestepIntoSlot(int globalTimestep, int outputSlot,
     int localTimestep = this->m_timestepLocalIdx[globalTimestep];
     this->ensureDataFileOpen(fileIdx);
 
+    load_timing::clock::time_point _t_read;
+    if (load_timing::g.enabled) _t_read = load_timing::tic();
     if (cfg.zTop)
         this->readZTop(localTimestep);
     else
@@ -314,7 +320,10 @@ void MPASOReader::loadGlobalTimestepIntoSlot(int globalTimestep, int outputSlot,
     else
         std::cerr << "[MPASOReader] Error: cfg.velocity is not properly set." << std::endl;
     this->readVertVelocityTop(localTimestep, 1);
+    if (load_timing::g.enabled) load_timing::g.read_s += load_timing::toc(_t_read);
 
+    load_timing::clock::time_point _t_conv;
+    if (load_timing::g.enabled) _t_conv = load_timing::tic();
     size_t gridBase = static_cast<size_t>(outputSlot) * nVertNodes;
     for (int localVertIdx = 0; localVertIdx < this->nLocalVertices; localVertIdx++) {
         int vertexOffset = localVertIdx * this->nVertLevels;
@@ -324,6 +333,7 @@ void MPASOReader::loadGlobalTimestepIntoSlot(int globalTimestep, int outputSlot,
                     vertexVertVelocity[outputSlot] + vertexOffset,
                     vertexZTop + gridBase + vertexOffset);
     }
+    if (load_timing::g.enabled) load_timing::g.convert_s += load_timing::toc(_t_conv);
 }
 
 void MPASOReader::appendTimestampsFromNcid(int ncid, double& t0, bool isFirst)

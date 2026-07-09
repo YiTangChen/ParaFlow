@@ -77,16 +77,24 @@ static void accumulate_gpu_timing(BlockTiming& timing,
                                   const mpaso_gpu_host::GPUTimingBreakdown& gpu)
 {
     constexpr double ms_to_s = 0.001;
-    timing.t_gpu_pipeline_wall     += gpu.pipeline_wall_ms * ms_to_s;
-    timing.t_gpu_host_prepare      += gpu.host_prepare_ms * ms_to_s;
-    timing.t_gpu_upload_topology   += gpu.upload_topology_ms * ms_to_s;
-    timing.t_gpu_upload_velocity   += gpu.upload_velocity_ms * ms_to_s;
-    timing.t_gpu_alloc             += gpu.alloc_ms * ms_to_s;
-    timing.t_gpu_upload_particles  += gpu.upload_particles_ms * ms_to_s;
     timing.t_trace_integrate_gpu   += gpu.kernel_ms * ms_to_s;
-    timing.t_gpu_download_results  += gpu.download_results_ms * ms_to_s;
-    timing.t_gpu_free              += gpu.free_ms * ms_to_s;
-    timing.t_gpu_field_release     += gpu.field_release_ms * ms_to_s;
+
+    // Transfer drill-down: 3 meaningful stages kept + everything sub-millisecond
+    // (per-launch alloc / particle H2D / result D2H / free / release) folded into misc.
+    const double flatten  = gpu.host_prepare_ms;
+    const double topo     = gpu.upload_topology_ms;
+    const double velocity = gpu.upload_velocity_ms;
+    const double misc     = gpu.alloc_ms + gpu.upload_particles_ms
+                          + gpu.download_results_ms + gpu.free_ms + gpu.field_release_ms;
+    timing.t_transfer_flatten         += flatten  * ms_to_s;
+    timing.t_transfer_upload_topology += topo     * ms_to_s;
+    timing.t_transfer_upload_velocity += velocity * ms_to_s;
+    timing.t_transfer_misc            += misc     * ms_to_s;
+
+    // trace_transfer is exactly the sum of its children (single axis, drill-downable),
+    // and mirrors the CPU path where this bucket is 0 — so both devices decompose
+    // trace_local_wall into the same {prepare, transfer, integrate, postprocess, enqueue}.
+    timing.t_trace_transfer           += (flatten + topo + velocity + misc) * ms_to_s;
 }
 
 #include "gpu_parity_tests.hpp"  // CPU-vs-GPU parity/smoke tests (dormant unless OSUFLOW_GPU_SMOKE set)
@@ -719,6 +727,7 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
 {
     diy::ContiguousAssigner   assigner(this->size, this->nblocks);
     int rank = world.rank();
+    double _t_run = pf_now(enable_timing);   // end-to-end driver wall: block_load + exchange + write
     diy::Master master(world,
                        1,                              // one thread
                        -1,                             // all blocks in memory
@@ -735,11 +744,17 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         diy::Link*   link = new diy::Link;   // link is this block's neighborhood
         b->set_rank(rank);
         if (enable_timing) b->timing.mem_vmrss_before_kb = pf_read_vmrss_kb();
+        if (enable_timing) { load_timing::g.enabled = true; load_timing::g.reset(); }
         double _t_load = pf_now(enable_timing);
         b->set_data(gid, this->meshFile.c_str(), this->vectorFiles[0].c_str(), this->seeds, this->areaIndices, this->cfg);
         pf_accum(b->timing.t_block_load, _t_load, enable_timing);
         if (enable_timing) {
             b->timing.n_seeds_initial      = (int)b->currentSeeds.size();
+            b->timing.t_load_grid_build    = load_timing::g.grid_build_s;
+            b->timing.t_load_read          = load_timing::g.read_s;
+            b->timing.t_load_convert       = load_timing::g.convert_s;
+            b->timing.t_load_seed_filter   = load_timing::g.seed_filter_s;
+            load_timing::g.enabled         = false;
             b->timing.mem_vmrss_after_kb   = pf_read_vmrss_kb();
             b->timing.n_local_cells        = b->nLocalCells;
             b->timing.n_global_cells       = b->nGlobalCells;
@@ -793,13 +808,41 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         pf_accum(blk->timing.t_output_write, _t_write, enable_timing);
     }
 
+    // End-to-end driver wall clock (block_load + exchange + write), reduced across ranks.
+    if (enable_timing) {
+        double t_run = MPI_Wtime() - _t_run;
+        fprintf(stderr, "TIMING phase=run_streamline_rank rank=%d t=%.6f\n", rank, t_run);
+        double run_min, run_max, run_sum;
+        MPI_Reduce(&t_run, &run_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_run, &run_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_run, &run_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0)
+            fprintf(stderr,
+                "TIMING phase=run_streamline_summary min=%.6f max=%.6f avg=%.6f imbalance=%.3f\n",
+                run_min, run_max, run_sum / this->size,
+                (run_min > 0.0) ? run_max / run_min : 0.0);
+    }
+
     // All measurement output — fully gated: zero overhead when enable_timing=false
     if (enable_timing) {
+        double rank_block_load = 0.0;   // per-rank sum of block_load, for the reduce below
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp) {
             b->timing.mem_peak_vmhwm_kb = pf_read_vmhwm_kb();
             fprintf(stderr,
                 "TIMING phase=block_load    rank=%d gid=%d t=%.6f nseeds=%d\n",
                 b->rank, cp.gid(), b->timing.t_block_load, b->timing.n_seeds_initial);
+            if (b->timing.t_load_grid_build > 0.0)
+                fprintf(stderr, "TIMING phase=load_grid_build rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_load_grid_build);
+            if (b->timing.t_load_read > 0.0)
+                fprintf(stderr, "TIMING phase=load_read rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_load_read);
+            if (b->timing.t_load_convert > 0.0)
+                fprintf(stderr, "TIMING phase=load_convert rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_load_convert);
+            if (b->timing.t_load_seed_filter > 0.0)
+                fprintf(stderr, "TIMING phase=load_seed_filter rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_load_seed_filter);
             fprintf(stderr,
                 "TIMING phase=trace_local_wall rank=%d gid=%d t=%.6f nsteps=%ld nrecv=%d\n",
                 b->rank, cp.gid(), b->timing.t_trace_local_wall,
@@ -816,6 +859,10 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
                 fprintf(stderr,
                     "TIMING phase=trace_integrate_gpu rank=%d gid=%d t=%.6f\n",
                     b->rank, cp.gid(), b->timing.t_trace_integrate_gpu);
+            if (b->timing.t_trace_transfer > 0.0)
+                fprintf(stderr,
+                    "TIMING phase=trace_transfer rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_trace_transfer);
             if (b->timing.t_trace_postprocess > 0.0)
                 fprintf(stderr,
                     "TIMING phase=trace_postprocess rank=%d gid=%d t=%.6f\n",
@@ -824,35 +871,20 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
                 fprintf(stderr,
                     "TIMING phase=trace_enqueue rank=%d gid=%d t=%.6f\n",
                     b->rank, cp.gid(), b->timing.t_trace_enqueue);
-            if (b->timing.t_gpu_pipeline_wall > 0.0) {
+            // Drill-down of trace_transfer (children sum to it; GPU only).
+            if (b->timing.t_trace_transfer > 0.0) {
                 fprintf(stderr,
-                    "TIMING phase=gpu_pipeline_wall rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_pipeline_wall);
+                    "TIMING phase=transfer_flatten rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_transfer_flatten);
                 fprintf(stderr,
-                    "TIMING phase=gpu_host_prepare rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_host_prepare);
+                    "TIMING phase=transfer_upload_topology rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_transfer_upload_topology);
                 fprintf(stderr,
-                    "TIMING phase=gpu_upload_topology rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_upload_topology);
+                    "TIMING phase=transfer_upload_velocity rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_transfer_upload_velocity);
                 fprintf(stderr,
-                    "TIMING phase=gpu_upload_velocity rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_upload_velocity);
-                fprintf(stderr,
-                    "TIMING phase=gpu_alloc rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_alloc);
-                fprintf(stderr,
-                    "TIMING phase=gpu_upload_particles rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_upload_particles);
-                fprintf(stderr,
-                    "TIMING phase=gpu_download_results rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_download_results);
-                fprintf(stderr,
-                    "TIMING phase=gpu_free rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_free);
-                if (b->timing.t_gpu_field_release > 0.0)
-                    fprintf(stderr,
-                        "TIMING phase=gpu_field_release rank=%d gid=%d t=%.6f\n",
-                        b->rank, cp.gid(), b->timing.t_gpu_field_release);
+                    "TIMING phase=transfer_misc rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_transfer_misc);
             }
             fprintf(stderr,
                 "TIMING phase=trace_dequeue rank=%d gid=%d t=%.6f\n",
@@ -876,15 +908,24 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
             fprintf(stderr,
                 "MEM_CELLCOUNT  rank=%d gid=%d n_local_cells=%d n_global_cells=%d\n",
                 b->rank, cp.gid(), b->timing.n_local_cells, b->timing.n_global_cells);
+            rank_block_load += b->timing.t_block_load;
         });
-        fprintf(stderr, "TIMING phase=dist_trace_total rank=%d t=%.6f\n", rank, t_iexchange);
+        double bl_min, bl_max, bl_sum;
+        MPI_Reduce(&rank_block_load, &bl_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&rank_block_load, &bl_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&rank_block_load, &bl_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0)
+            fprintf(stderr,
+                "TIMING phase=block_load_summary min=%.6f max=%.6f avg=%.6f imbalance=%.3f\n",
+                bl_min, bl_max, bl_sum / this->size, (bl_min > 0.0) ? bl_max / bl_min : 0.0);
+        fprintf(stderr, "TIMING phase=trace_exchange_rank rank=%d t=%.6f\n", rank, t_iexchange);
         double iex_min, iex_max, iex_sum;
         MPI_Reduce(&t_iexchange, &iex_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
         MPI_Reduce(&t_iexchange, &iex_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         MPI_Reduce(&t_iexchange, &iex_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         if (rank == 0)
             fprintf(stderr,
-                "TIMING phase=dist_trace_global min=%.6f max=%.6f avg=%.6f imbalance=%.3f\n",
+                "TIMING phase=trace_exchange_summary min=%.6f max=%.6f avg=%.6f imbalance=%.3f\n",
                 iex_min, iex_max, iex_sum / this->size,
                 (iex_min > 0.0) ? iex_max / iex_min : 0.0);
     }
@@ -1226,6 +1267,7 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
 {
     diy::ContiguousAssigner   assigner(this->size, this->nblocks);
     int rank = world.rank();
+    double _t_run = pf_now(enable_timing);   // end-to-end driver wall: block_load + windows + write
     diy::Master master(world,
                        1,                      // one thread
                        -1,                     // all blocks in memory
@@ -1242,12 +1284,18 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
         diy::Link* link = new diy::Link;
         b->set_rank(rank);
         if (enable_timing) b->timing.mem_vmrss_before_kb = pf_read_vmrss_kb();
+        if (enable_timing) { load_timing::g.enabled = true; load_timing::g.reset(); }
         double _t_load = pf_now(enable_timing);
         b->set_data(gid, this->meshFile.c_str(), this->vectorFiles[0].c_str(),
                     this->seeds, this->areaIndices, this->cfg);
         pf_accum(b->timing.t_block_load, _t_load, enable_timing);
         if (enable_timing) {
             b->timing.n_seeds_initial      = (int)b->currentSeeds.size();
+            b->timing.t_load_grid_build    = load_timing::g.grid_build_s;
+            b->timing.t_load_read          = load_timing::g.read_s;
+            b->timing.t_load_convert       = load_timing::g.convert_s;
+            b->timing.t_load_seed_filter   = load_timing::g.seed_filter_s;
+            load_timing::g.enabled         = false;
             b->timing.mem_vmrss_after_kb   = pf_read_vmrss_kb();
             b->timing.n_local_cells        = b->nLocalCells;
             b->timing.n_global_cells       = b->nGlobalCells;
@@ -1362,13 +1410,41 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
         pf_accum(blk->timing.t_output_write, _t_write, enable_timing);
     }
 
+    // End-to-end driver wall clock (block_load + windows + write), reduced across ranks.
+    if (enable_timing) {
+        double t_run = MPI_Wtime() - _t_run;
+        fprintf(stderr, "TIMING phase=run_pathline_rank rank=%d t=%.6f\n", rank, t_run);
+        double run_min, run_max, run_sum;
+        MPI_Reduce(&t_run, &run_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_run, &run_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&t_run, &run_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0)
+            fprintf(stderr,
+                "TIMING phase=run_pathline_summary min=%.6f max=%.6f avg=%.6f imbalance=%.3f\n",
+                run_min, run_max, run_sum / this->size,
+                (run_min > 0.0) ? run_max / run_min : 0.0);
+    }
+
     // All measurement output — fully gated: zero overhead when enable_timing=false
     if (enable_timing) {
+        double rank_block_load = 0.0;   // per-rank sum of block_load, for the reduce below
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp) {
             b->timing.mem_peak_vmhwm_kb = pf_read_vmhwm_kb();
             fprintf(stderr,
                 "TIMING phase=block_load    rank=%d gid=%d t=%.6f nseeds=%d\n",
                 b->rank, cp.gid(), b->timing.t_block_load, b->timing.n_seeds_initial);
+            if (b->timing.t_load_grid_build > 0.0)
+                fprintf(stderr, "TIMING phase=load_grid_build rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_load_grid_build);
+            if (b->timing.t_load_read > 0.0)
+                fprintf(stderr, "TIMING phase=load_read rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_load_read);
+            if (b->timing.t_load_convert > 0.0)
+                fprintf(stderr, "TIMING phase=load_convert rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_load_convert);
+            if (b->timing.t_load_seed_filter > 0.0)
+                fprintf(stderr, "TIMING phase=load_seed_filter rank=%d gid=%d t=%.6f\n",
+                        b->rank, cp.gid(), b->timing.t_load_seed_filter);
             fprintf(stderr,
                 "TIMING phase=trace_local_wall rank=%d gid=%d t=%.6f nsteps=%ld nrecv=%d\n",
                 b->rank, cp.gid(), b->timing.t_trace_local_wall,
@@ -1385,6 +1461,10 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
                 fprintf(stderr,
                     "TIMING phase=trace_integrate_gpu rank=%d gid=%d t=%.6f\n",
                     b->rank, cp.gid(), b->timing.t_trace_integrate_gpu);
+            if (b->timing.t_trace_transfer > 0.0)
+                fprintf(stderr,
+                    "TIMING phase=trace_transfer rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_trace_transfer);
             if (b->timing.t_trace_postprocess > 0.0)
                 fprintf(stderr,
                     "TIMING phase=trace_postprocess rank=%d gid=%d t=%.6f\n",
@@ -1393,35 +1473,20 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
                 fprintf(stderr,
                     "TIMING phase=trace_enqueue rank=%d gid=%d t=%.6f\n",
                     b->rank, cp.gid(), b->timing.t_trace_enqueue);
-            if (b->timing.t_gpu_pipeline_wall > 0.0) {
+            // Drill-down of trace_transfer (children sum to it; GPU only).
+            if (b->timing.t_trace_transfer > 0.0) {
                 fprintf(stderr,
-                    "TIMING phase=gpu_pipeline_wall rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_pipeline_wall);
+                    "TIMING phase=transfer_flatten rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_transfer_flatten);
                 fprintf(stderr,
-                    "TIMING phase=gpu_host_prepare rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_host_prepare);
+                    "TIMING phase=transfer_upload_topology rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_transfer_upload_topology);
                 fprintf(stderr,
-                    "TIMING phase=gpu_upload_topology rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_upload_topology);
+                    "TIMING phase=transfer_upload_velocity rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_transfer_upload_velocity);
                 fprintf(stderr,
-                    "TIMING phase=gpu_upload_velocity rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_upload_velocity);
-                fprintf(stderr,
-                    "TIMING phase=gpu_alloc rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_alloc);
-                fprintf(stderr,
-                    "TIMING phase=gpu_upload_particles rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_upload_particles);
-                fprintf(stderr,
-                    "TIMING phase=gpu_download_results rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_download_results);
-                fprintf(stderr,
-                    "TIMING phase=gpu_free rank=%d gid=%d t=%.6f\n",
-                    b->rank, cp.gid(), b->timing.t_gpu_free);
-                if (b->timing.t_gpu_field_release > 0.0)
-                    fprintf(stderr,
-                        "TIMING phase=gpu_field_release rank=%d gid=%d t=%.6f\n",
-                        b->rank, cp.gid(), b->timing.t_gpu_field_release);
+                    "TIMING phase=transfer_misc rank=%d gid=%d t=%.6f\n",
+                    b->rank, cp.gid(), b->timing.t_transfer_misc);
             }
             fprintf(stderr,
                 "TIMING phase=trace_dequeue rank=%d gid=%d t=%.6f\n",
@@ -1445,15 +1510,24 @@ void ParaFlow::GenPathLines(std::list<std::vector<VECTOR3>>& pathlines)
             fprintf(stderr,
                 "MEM_CELLCOUNT  rank=%d gid=%d n_local_cells=%d n_global_cells=%d\n",
                 b->rank, cp.gid(), b->timing.n_local_cells, b->timing.n_global_cells);
+            rank_block_load += b->timing.t_block_load;
         });
-        fprintf(stderr, "TIMING phase=dist_trace_total rank=%d t=%.6f\n", rank, t_iexchange);
+        double bl_min, bl_max, bl_sum;
+        MPI_Reduce(&rank_block_load, &bl_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&rank_block_load, &bl_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&rank_block_load, &bl_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0)
+            fprintf(stderr,
+                "TIMING phase=block_load_summary min=%.6f max=%.6f avg=%.6f imbalance=%.3f\n",
+                bl_min, bl_max, bl_sum / this->size, (bl_min > 0.0) ? bl_max / bl_min : 0.0);
+        fprintf(stderr, "TIMING phase=trace_exchange_rank rank=%d t=%.6f\n", rank, t_iexchange);
         double iex_min, iex_max, iex_sum;
         MPI_Reduce(&t_iexchange, &iex_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
         MPI_Reduce(&t_iexchange, &iex_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         MPI_Reduce(&t_iexchange, &iex_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         if (rank == 0)
             fprintf(stderr,
-                "TIMING phase=dist_trace_global min=%.6f max=%.6f avg=%.6f imbalance=%.3f\n",
+                "TIMING phase=trace_exchange_summary min=%.6f max=%.6f avg=%.6f imbalance=%.3f\n",
                 iex_min, iex_max, iex_sum / this->size,
                 (iex_min > 0.0) ? iex_max / iex_min : 0.0);
     }
@@ -1539,15 +1613,12 @@ void ParaFlow::CheckPointsInBlock(std::function<void(int gid, const std::vector<
         }
     }
 
-    master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp) {
-        std::ifstream f("/proc/self/status");
-        std::string line;
-        while (std::getline(f, line)) {
-            if (line.rfind("VmHWM:", 0) == 0) {
-                fprintf(stderr, "MEM_PEAK rank=%d gid=%d %s\n",
-                        b->rank, cp.gid(), line.c_str());
-                break;
-            }
-        }
-    });
+    // Peak-RSS probe: gated by enable_timing like all other profiling output, and
+    // emitted in the current MEM_PEAK format (vmhwm_kb=) rather than the legacy string.
+    if (enable_timing) {
+        master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp) {
+            fprintf(stderr, "MEM_PEAK       rank=%d gid=%d vmhwm_kb=%ld\n",
+                    b->rank, cp.gid(), pf_read_vmhwm_kb());
+        });
+    }
 }
