@@ -3,10 +3,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ###### NERSC
-CC=/opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3/bin/mpicc
-CXX=/opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3/bin/mpicxx
-CUDA_MODULE_NERSC=cudatoolkit
-CUDA_ARCH_DEFAULT_NERSC=80
+# CC=/opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3/bin/mpicc
+# CXX=/opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3/bin/mpicxx
+# CUDA_MODULE_NERSC=cudatoolkit
+# CUDA_ARCH_DEFAULT_NERSC=80
 
 ####### ascend
 # CC=/apps/spack/0.21/ascend/linux-rhel9-zen2/mvapich/gcc/12.3.0/3.0-fndadii/bin/mpicc
@@ -15,10 +15,12 @@ CUDA_ARCH_DEFAULT_NERSC=80
 # CUDA_ARCH_DEFAULT_ASCEND=80
 
 ####### cardinal
-# CC=/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/mvapich/gcc/12.3.0/3.0-mfh5vjl/bin/mpicc
-# CXX=/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/mvapich/gcc/12.3.0/3.0-mfh5vjl/bin/mpicxx
-# CUDA_MODULE_CARDINAL=cuda/12.4.1
-# CUDA_ARCH_DEFAULT_CARDINAL=90
+# module purge
+# module load gcc/12.3.0 mvapich/3.0
+CC=/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/mvapich/gcc/12.3.0/3.0-mfh5vjl/bin/mpicc
+CXX=/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/mvapich/gcc/12.3.0/3.0-mfh5vjl/bin/mpicxx
+CUDA_MODULE_CARDINAL=cuda/12.4.1
+CUDA_ARCH_DEFAULT_CARDINAL=90
 JOBS=${JOBS:-$(nproc)}
 
 # ---- optional CUDA backend ----
@@ -50,16 +52,16 @@ if [[ "$OSUFLOW_ENABLE_CUDA" == "1" ]]; then
 fi
 
 ####### NERSC
-NETCDF_DIR=${NETCDF_DIR:-/opt/cray/pe/netcdf/4.9.2.1/gnu/12.3}
-NETCDF_CXX_DIR=${NETCDF_CXX_DIR:-/opt/cray/pe/netcdf/4.9.2.1/gnu/12.3}
+# NETCDF_DIR=${NETCDF_DIR:-/opt/cray/pe/netcdf/4.9.2.1/gnu/12.3}
+# NETCDF_CXX_DIR=${NETCDF_CXX_DIR:-/opt/cray/pe/netcdf/4.9.2.1/gnu/12.3}
 
 ####### ascend
 # NETCDF_DIR=${NETCDF_DIR:-/apps/spack/0.21/ascend/linux-rhel9-zen2/netcdf-c/gcc/12.3.0/mvapich/3.0/4.9.2-j2kquab/}
 # NETCDF_CXX_DIR=${NETCDF_CXX_DIR:-/apps/spack/0.21/ascend/linux-rhel9-zen2/netcdf-cxx4/gcc/12.3.0/mvapich/3.0/4.3.1-aenx4lr/}
 
 ####### cardinal
-# NETCDF_DIR=${NETCDF_DIR:-/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/netcdf-c/gcc/12.3.0/mvapich/3.0/4.9.2-qd5jghn/}
-# NETCDF_CXX_DIR=${NETCDF_CXX_DIR:-/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/netcdf-cxx4/gcc/12.3.0/mvapich/3.0/4.3.1-tgr36hp/}
+NETCDF_DIR=${NETCDF_DIR:-/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/netcdf-c/gcc/12.3.0/mvapich/3.0/4.9.2-qd5jghn/}
+NETCDF_CXX_DIR=${NETCDF_CXX_DIR:-/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/netcdf-cxx4/gcc/12.3.0/mvapich/3.0/4.3.1-tgr36hp/}
 
 cmake_build() {
     local dir="$1"; shift
