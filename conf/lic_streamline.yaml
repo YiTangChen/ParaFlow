@@ -1,0 +1,81 @@
+# CPU streamline-LIC config (ParaFlow_lic).
+#
+# Streamlines are integrated on the CPU by ParaFlow::GenStreamLines -- the same
+# method ./ParaFlow_streamline uses (DIY iexchange + RK4 + cross-block handoff) --
+# then folded into a LIC image written as a single grayscale PNG.
+#
+# CPU parallelism: one MPI rank per block, no GPU binding. Use as many ranks as
+# you have cores available; nproc must equal nblocks and match the partition file.
+# To change N, regenerate the partition:
+#     gpmetis conf/graph.info N        # -> conf/graph.info.part.N
+# then set nproc = nblocks = N and graph_partition_indices to match.
+#
+# Launch (plain MPI, no --gpus / --gpu-bind):
+#   srun -n 8 ./ParaFlow_lic conf/lic_streamline.yaml
+#   # or: mpirun -np 8 ./ParaFlow_lic conf/lic_streamline.yaml
+
+enable_timing: false
+outputDir: lic_output             # lic.png lands here
+
+maxsteps: 25000                    # RK4 steps per streamline, per direction (fwd + back)
+record_interval: 50               # ~50 stored points per streamline per direction
+dt: 60                            # fixed step (s)
+
+useGPU: false                     # CPU tracer
+lic_direction: both               # forward | backward | both (both = LIC line runs through the seed)
+lic_width: 2048                   # 2:1 world-map aspect for the 1024x1024 seed grid
+lic_height: 1024                  # override the seed-grid auto-size
+nproc: 8                          # MPI ranks; one block per rank
+nblocks: 8                        # one block per rank; must match graph.info.*.part.8
+
+# --- LIC folding strategy (A/B comparison) ---
+# false = fold each rank's per-block SEGMENTS locally, then reduce the images
+# true  = rank 0 reads the <gid>.bin files, reassembles WHOLE streamlines
+#         (scripts/plot/read_traces.py logic), and folds those.
+#         NOTE: <gid>.bin keeps only the LAST direction, so for combine use
+#         lic_direction: forward (or backward), not both.
+lic_combine: false
+
+# --- Where the streamlines live: memory or storage ---------------------------
+#   memory = traces are folded straight out of RAM and freed right after (one
+#            direction at a time), and the per-block <gid>.bin files are DELETED
+#            as soon as the run finishes. The only artifact left is lic.png.
+#   disk   = the <gid>.bin files are KEPT (moved into the run folder
+#            <outputDir>/<mode>_<dir>_<data>/) so the raw trajectories can be
+#            reused later (scripts/plot/read_traces.py, plotting, ...).
+#
+# NOTE: ParaFlow::GenStreamLines always writes <gid>.bin while it fills the
+# in-memory list (block.hpp write_trajectory does both in one pass), so `memory`
+# cannot skip that transient write -- it guarantees the files are GONE afterwards.
+# To keep even the transient write off real disk, point outputDir at a tmpfs (RAM)
+# path, e.g.  outputDir: /dev/shm/lic_run   (then copy lic.png out afterwards).
+#
+# Supersedes the old boolean `keep_streamline_bin` (still honored if this is absent).
+streamline_storage: memory        # memory | disk
+
+# Pre-filter tagging: 1st run inBlock-filters and writes each block's seeds to
+# <seedFile>.licblock<gid>_of<nblocks>.bin; later runs read those and SKIP the
+# slow 1M-seed scan. Delete those .bin files if you change the seeds/partition.
+seed_cache: true
+
+meshfile_src: /fs/scratch/PAS0027/Jiaxin/mpas-o-rendering/high-res/20210421_sim7_CORE_18to6v3.mpaso.rst.0015-01-01_00000.nc                     # geometry
+datafile_src: /fs/scratch/PAS0027/Jiaxin/mpas-o-rendering/high-res/20210421_sim7_CORE_18to6v3.mpaso.hist.am.timeSeriesStatsMonthly.0015-01-01.nc # velocity
+graph_partition_indices: conf/graph.info.highres.part.8
+isBinarySeed: true
+seedFile: seed/seed_points_1024x1024_uv_xyz.bin
+
+# time-varying variables (streamlines use a single steady snapshot)
+isTimeVarying: false
+velocity:
+  cartesian:      # XYZ
+    X: null
+    Y: null
+    Z: null
+  spherical:      # zonal & meridional
+    zonal: null
+    meridional: null
+  normal: timeMonthly_avg_normalVelocity   # MPAS-O edge-normal velocity
+zTop: null
+layerThickness: timeMonthly_avg_layerThickness
+vertVelocityTop: timeMonthly_avg_vertVelocityTop
+xtime: xtime_startMonthly

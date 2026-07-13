@@ -345,29 +345,36 @@ struct Block
         return localCellId * this->nVertLevels + vLevel;
     }
 
-    void write_trajectory(const std::string& filename, std::list<std::vector<VECTOR3>>& output, int interval = 1) {
-        std::ofstream outfile(filename, ios::out | ios::binary);
+    // writeToDisk=false skips the file entirely -- output still gets every segment,
+    // just with no bytes ever touching storage (used by streamline_storage: memory).
+    void write_trajectory(const std::string& filename, std::list<std::vector<VECTOR3>>& output, int interval = 1, bool writeToDisk = true) {
+        std::ofstream outfile;
+        if (writeToDisk) outfile.open(filename, ios::out | ios::binary);
         for(int segidx = 0; segidx < (int)this->segs.size(); segidx++) {
             int pid  = segs[segidx].pid;
             int gid  = segs[segidx].gid;
             int sid  = segs[segidx].sid;
             int nPts = (int)segs[segidx].coords.size();
             // coords are already downsampled by interval during tracing
-            outfile.write((char *) &pid,  sizeof(int));
-            outfile.write((char *) &gid,  sizeof(int));
-            outfile.write((char *) &sid,  sizeof(int));
-            outfile.write((char *) &nPts, sizeof(int));
+            if (writeToDisk) {
+                outfile.write((char *) &pid,  sizeof(int));
+                outfile.write((char *) &gid,  sizeof(int));
+                outfile.write((char *) &sid,  sizeof(int));
+                outfile.write((char *) &nPts, sizeof(int));
+            }
             std::vector<VECTOR3> seg2vec;
             seg2vec.reserve(nPts);
             for(int ptidx = 0; ptidx < nPts; ptidx++) {
                 seg2vec.push_back(segs[segidx].coords[ptidx]);
-                outfile.write((char *) &(segs[segidx].coords[ptidx][0]), sizeof(double));
-                outfile.write((char *) &(segs[segidx].coords[ptidx][1]), sizeof(double));
-                outfile.write((char *) &(segs[segidx].coords[ptidx][2]), sizeof(double));
+                if (writeToDisk) {
+                    outfile.write((char *) &(segs[segidx].coords[ptidx][0]), sizeof(double));
+                    outfile.write((char *) &(segs[segidx].coords[ptidx][1]), sizeof(double));
+                    outfile.write((char *) &(segs[segidx].coords[ptidx][2]), sizeof(double));
+                }
             }
             output.push_back(std::move(seg2vec));
         }
-        outfile.close();
+        if (writeToDisk) outfile.close();
     }
 };
 

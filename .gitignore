@@ -25,6 +25,8 @@ Thumbs.db
 /DrawSubdomain
 /ParaFlow_streamline
 /ParaFlow_pathline
+/ParaFlow_lic
+/ParaFlow_lic_gpu
 
 # Generated output directories
 /drawSubdomain/
@@ -32,6 +34,8 @@ Thumbs.db
 /streamlines/
 /pathlines/
 /logs/
+/lic_output/
+/lic_output_gpu/
 /block_outputs/
 /output/
 /seeds/

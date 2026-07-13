@@ -35,7 +35,11 @@ public:
     ParaFlow(int argc, char* argv[], const char* configFile);
     ~ParaFlow();
 
-    void GenStreamLines(std::list<std::vector<VECTOR3>>& sl_list);
+    // dt_sign selects the integration direction of the (otherwise identical) method:
+    //   +1.0 = forward (default, what ParaFlow_streamline uses), -1.0 = backward.
+    // Call twice (+1 then -1) to trace both ways from each seed.
+    // writeToDisk=false skips writing each block's <gid>.bin (streamline_storage: memory).
+    void GenStreamLines(std::list<std::vector<VECTOR3>>& sl_list, double dt_sign = 1.0, bool writeToDisk = true);
     void GenPathLines(std::list<std::vector<VECTOR3>>& pl_list);
     void CheckPointsInBlock(std::function<void(int gid, const std::vector<VECTOR3>&)> onBlock = nullptr);
     void setSeeds(std::vector<VECTOR3> s) { seeds = std::move(s); }
