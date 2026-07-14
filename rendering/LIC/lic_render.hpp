@@ -1,15 +1,11 @@
 // lic_render.hpp
 // -----------------------------------------------------------------------------
-// The LIC method, and nothing else. Given streamlines that were ALREADY generated
-// OUTSIDE this folder -- by ParaFlow::GenStreamLines, called from the repo-root
-// driver (ParaFlow_lic.cpp / ParaFlow_lic_gpu.cpp) exactly the way
-// ParaFlow_streamline.cpp calls it -- this folds them into a Line-Integral-
-// Convolution image and writes ONE grayscale PNG on rank 0.
+// The LIC method, and nothing else. Folds streamlines already generated OUTSIDE
+// this folder (ParaFlow::GenStreamLines, called from ParaFlow_lic.cpp /
+// ParaFlow_lic_gpu.cpp) into a Line-Integral-Convolution image and writes ONE
+// grayscale PNG on rank 0. No streamline generation, no MPI init here.
 //
-// This header does NO streamline generation and does NOT init MPI. It is purely
-// the LIC rendering step, so everything under rendering/LIC/ stays "LIC only".
-//
-// Include AFTER <ParaFlow.hpp> (it needs VECTOR3) and after MPI is initialized
+// Include AFTER <ParaFlow.hpp> (needs VECTOR3) and after MPI is initialized
 // (the ParaFlow ctor does that in the drivers).
 // -----------------------------------------------------------------------------
 #ifndef LIC_RENDER_HPP
@@ -37,12 +33,9 @@
 #endif
 #include "lic_core.hpp"     // LicImage, lic_add_streamline, lic_reduce, PNG (pure engine)
 
-// Which integration directions to run, read from config key `lic_direction`.
-// Since a scientific streamline is traced one way from its seed but a LIC line
-// should run THROUGH the seed:
-//     forward  -> {+1}   backward -> {-1}   both (default) -> {+1, -1}
-// The caller runs pf.GenStreamLines(sls, sign) for each returned sign -- that call
-// (the streamline "run") lives in the driver, OUTSIDE this folder.
+// Integration directions to run (config key `lic_direction`): a LIC line must
+// run THROUGH its seed, unlike a one-way scientific streamline.
+//     forward -> {+1}   backward -> {-1}   both (default) -> {+1, -1}
 inline std::vector<double> lic_directions(const std::string& configPath, int rank = 0)
 {
     YAML::Node config = YAML::LoadFile(configPath);
@@ -57,10 +50,8 @@ inline std::vector<double> lic_directions(const std::string& configPath, int ran
     return {+1.0, -1.0};
 }
 
-// Number of seeds, read straight from the seed file named in the config -- so the
-// LIC image auto-sizing needs NO access to ParaFlow's private seed list. Binary
-// seed files are 3 float64 per seed (24 bytes); text files are one seed per line.
-// This is the raw grid count (e.g. 1024*1024), matching what ParaFlow reads in.
+// Seed count read from the config's seed file, so image auto-sizing needs no
+// access to ParaFlow's private seed list. Binary: 3 float64/seed; text: 1/line.
 inline size_t lic_count_seeds(const std::string& configPath)
 {
     YAML::Node config = YAML::LoadFile(configPath);
@@ -82,11 +73,8 @@ inline size_t lic_count_seeds(const std::string& configPath)
     return n;
 }
 
-// Name for this run's output folder: "<mode>_<direction>_<datafile>", e.g.
-// "gpu_both_...mpaso.hist.am.timeSeriesStatsMonthly.0015-01-01". `mode` is "gpu"
-// or "cpu" (from the driver); the direction and datafile name come from the config
-// (datafile = basename of datafile_src without directory or trailing .nc). Two runs
-// with the same mode/direction/data reuse the same folder.
+// Output folder name: "<mode>_<direction>_<datafile>" (datafile = basename of
+// datafile_src, .nc stripped). Same mode/direction/data reuses the same folder.
 inline std::string lic_run_label(const std::string& mode, const std::string& configPath)
 {
     YAML::Node config = YAML::LoadFile(configPath);
@@ -111,43 +99,26 @@ inline std::string lic_run_label(const std::string& mode, const std::string& con
     return mode + "_" + d + "_" + dataName;
 }
 
-// Which of the two folding strategies the driver should run (config key
-// `lic_combine`), so both can be A/B compared with the same binary:
-//   false = METHOD 2 (no combine): each rank folds its OWN per-block streamline
-//           SEGMENTS straight into a local image (lic_add_streamline), then the
-//           per-rank IMAGES are summed (lic_reduce). Distributed; each fragment's
-//           footprint is averaged on its own.
-//   true  = METHOD 1 (combine): rank 0 reads the per-block <gid>.bin files and
-//           REASSEMBLES the segments (by pid/sid) into WHOLE streamlines -- the
-//           same thing scripts/plot/read_traces.py does -- then folds those whole
-//           lines. Each complete streamline's footprint is averaged as one.
-// The two give DIFFERENT images (fragment averages vs whole-line averages); that
-// is the point of the comparison. NOTE: <gid>.bin is truncated per direction, so a
-// combine run reflects the LAST traced direction only -- use lic_direction:
-// forward or backward for a clean combine comparison.
+// Folding strategy (config `lic_combine`), for A/B comparison:
+//   false = METHOD 2: each rank folds its own segments locally, then the images
+//           are summed (lic_reduce) -- each fragment's footprint averaged alone.
+//   true  = METHOD 1: rank 0 reassembles whole streamlines from <gid>.bin (like
+//           read_traces.py) and folds those -- each whole line averaged as one.
+// Different images by design. NOTE: <gid>.bin is per-direction, so combine only
+// reflects the LAST traced direction -- use forward/backward for a clean compare.
 inline bool lic_combine(const std::string& configPath)
 {
     YAML::Node config = YAML::LoadFile(configPath);
     return config["lic_combine"] && config["lic_combine"].as<bool>();
 }
 
-// Where the traced streamlines end up, from config key `streamline_storage`:
-//   memory = fold the streamlines straight out of RAM and DELETE the per-block
-//            <gid>.bin files as soon as the run is done. The only artifact left is
-//            the PNG. Each direction's traces are also freed right after folding
-//            (see the drivers), so peak memory is one direction, not both.
-//   disk   = KEEP the <gid>.bin files (moved into the run folder) so the raw
-//            trajectories can be reused later (read_traces.py, plotting, ...).
-//
-// CORE LIMITATION (why `memory` cannot skip the write): ParaFlow::GenStreamLines
-// always calls block.hpp's write_trajectory, which fills the in-memory list and
-// writes <gid>.bin in the SAME pass -- there is no fill-only path. So `memory`
-// guarantees the files are gone afterwards, but the transient write still happens.
-// To keep even that write off real disk, point outputDir at a tmpfs (RAM) path:
-//     outputDir: /dev/shm/lic_run        # tmpfs = RAM; copy the PNG out afterwards
-//
-// Back-compat: if `streamline_storage` is absent, fall back to the older boolean
-// `keep_streamline_bin` (true -> disk, false -> memory).
+// Where traces end up (config `streamline_storage`):
+//   memory = fold from RAM, then DELETE <gid>.bin -- only the PNG remains.
+//   disk   = KEEP <gid>.bin in the run folder for later reuse (read_traces.py, ...).
+// `memory` still writes <gid>.bin transiently: GenStreamLines always calls
+// write_trajectory, which has no fill-only path. Point outputDir at tmpfs (e.g.
+// /dev/shm/lic_run) to keep that write off real disk too.
+// Back-compat: falls back to bool `keep_streamline_bin` if the key is absent.
 inline bool lic_keep_bin(const std::string& configPath, int rank = 0)
 {
     YAML::Node config = YAML::LoadFile(configPath);
@@ -168,10 +139,8 @@ inline bool lic_keep_bin(const std::string& configPath, int rank = 0)
     return config["keep_streamline_bin"] && config["keep_streamline_bin"].as<bool>();
 }
 
-// Whether GenStreamLines should write <gid>.bin to disk in the first place. Only
-// meaningful for METHOD 2 (no combine) -- METHOD 1 (combine) always needs the
-// on-disk file to reassemble whole streamlines, so callers must ignore this in
-// combine mode. Absent key -> true (old behavior: always write, unaffected).
+// Whether GenStreamLines should write <gid>.bin at all. Only meaningful for
+// METHOD 2 -- METHOD 1 always needs the file. Absent key -> true (write).
 inline bool lic_write_bin_to_disk(const std::string& configPath)
 {
     YAML::Node config = YAML::LoadFile(configPath);
@@ -183,11 +152,9 @@ inline bool lic_write_bin_to_disk(const std::string& configPath)
     return (s == "disk" || s == "storage");   // memory (or unrecognized) -> skip write
 }
 
-// A LIC run in progress: the accumulating image plus what the output step needs.
-// img is folded at the NATIVE resolution (matching the seed grid's own density,
-// so every pixel has a chance to be crossed by some streamline -- no black
-// stripes). stretchW/stretchH scale that finished image up at write time (see
-// lic_write_outputs) to reach the requested output aspect ratio.
+// A run in progress: the accumulating image plus output-step state. img folds at
+// the NATIVE (seed-matched) resolution to avoid black stripes; stretchW/H scale
+// the finished image at write time (lic_write_outputs) to the output aspect ratio.
 struct LicRun {
     LicImage    img;
     uint64_t    seed = 0;
@@ -199,24 +166,16 @@ struct LicRun {
         : img(w, h, s), seed(s), mode(std::move(m)) {}
 };
 
-// Start a run: build the noise image. Reads lic_seed, then picks the NATIVE
-// resolution the streamlines fold into:
-//   1) seed_width/seed_height (recommended) -> the noise/fold image is sized to
-//      exactly match the seed grid's own density, so every pixel is reachable by
-//      some streamline. lic_ratio_w/lic_ratio_h (default 1:1) then just STRETCH
-//      the finished image to seed_width*ratioW x seed_height*ratioH at write time
-//      (lic_write_outputs) -- a plain resize, not a change in fold density, so it
-//      never introduces black stripes. e.g. seed_width/height: 256, lic_ratio_w: 2,
-//      lic_ratio_h: 1 folds at 256x256 and stretches the output to 512x256.
-//   2) lic_width/lic_height (legacy, no seed_width/height set) -> used as the
-//      native fold resolution directly, no stretch. You are responsible for
-//      keeping these <= the seed grid's actual resolution per dimension;
-//      exceeding it reintroduces the stripe artifact.
-//   3) neither -> auto-size from nSeeds, assuming an N*N (square) or (2N)*N (2:1)
-//      seed grid.
-// The noise map is IDENTICAL on every rank (config seed, or a fresh seed drawn by
-// rank 0 and broadcast). `mode` ("gpu"/"cpu") is remembered only to name the
-// output folder.
+// Start a run: build the noise image, picking the NATIVE fold resolution:
+//   1) seed_width/height (recommended) -> fold matches the seed grid's density
+//      (every pixel reachable); lic_ratio_w/h then just STRETCHES the output at
+//      write time (lic_write_outputs) -- a plain resize, so no black stripes.
+//      e.g. seed_width/height 256 + ratio 2:1 folds 256x256, outputs 512x256.
+//   2) lic_width/height (legacy) -> used directly, no stretch. Must stay <= the
+//      seed grid's resolution per dimension or stripes reappear.
+//   3) neither -> auto-size from nSeeds (assumes an N*N or 2N*N seed grid).
+// Noise map is IDENTICAL on every rank (config seed, or rank 0 draws + broadcasts).
+// `mode` ("gpu"/"cpu") is only remembered to name the output folder.
 inline LicRun lic_begin(const std::string& configPath, size_t nSeeds,
                         const std::string& mode = "cpu", MPI_Comm comm = MPI_COMM_WORLD)
 {
@@ -284,9 +243,9 @@ inline LicRun lic_begin(const std::string& configPath, size_t nSeeds,
     return run;
 }
 
-// Fold one batch of streamlines into the run image (used by METHOD 2, once per
-// direction). A VECTOR3 is three contiguous doubles, so a vector<VECTOR3>
-// reinterpret-casts straight to the flat [x,y,z,...] array lic_add_streamline wants.
+// Fold one batch of streamlines into the run image (METHOD 2, once per direction).
+// VECTOR3 is 3 contiguous doubles, so vector<VECTOR3> reinterpret-casts straight
+// to the flat array lic_add_streamline wants.
 inline void lic_fold(LicRun& run, const std::list<std::vector<VECTOR3>>& streamlines)
 {
     for (const auto& tr : streamlines) {
@@ -296,13 +255,10 @@ inline void lic_fold(LicRun& run, const std::list<std::vector<VECTOR3>>& streaml
     run.folded += (long)streamlines.size();
 }
 
-// Rank-0 output step, shared by both methods: create the per-run folder
-//     <outputDir>/<mode>_<direction>_<datafile>/
-// write lic.png + run_info.txt (a copy of the config = the run's features) there,
-// then move-or-delete the per-block <gid>.bin files GenStreamLines left in the base
-// outputDir (config key keep_streamline_bin -- applied here so the core
-// GenStreamLines is untouched). Assumes run.img already holds the FINAL image on
-// rank 0 (after lic_reduce for METHOD 2, or after the gather-fold for METHOD 1).
+// Rank-0 output step, shared by both methods: create <outputDir>/<mode>_
+// <direction>_<datafile>/, write lic.png + run_info.txt (a config copy), then
+// move-or-delete the per-block <gid>.bin files GenStreamLines left behind.
+// Assumes run.img already holds the FINAL image on rank 0.
 inline void lic_write_outputs(LicRun& run, const std::string& configPath,
                               MPI_Comm comm = MPI_COMM_WORLD)
 {
@@ -323,9 +279,8 @@ inline void lic_write_outputs(LicRun& run, const std::string& configPath,
         const std::string runDir = outputDir + "/" + lic_run_label(run.mode, configPath);
         fs::create_directories(runDir);
 
-        // 1) the LIC image: fold at native (seed-matched) resolution, then stretch
-        // to the requested output size (lic_ratio_w/h) -- a plain resize, so it
-        // cannot introduce the black-stripe artifact a finer fold would.
+        // 1) the LIC image: fold at native resolution, then stretch to the
+        // requested output size (lic_ratio_w/h) -- a plain resize, no stripes.
         const std::string pngPath = runDir + "/lic.png";
         std::vector<uint8_t> gray = lic_to_gray(run.img);
         if (run.stretchW != 1 || run.stretchH != 1)
@@ -350,9 +305,8 @@ inline void lic_write_outputs(LicRun& run, const std::string& configPath,
         }
         std::cerr << "[lic] wrote " << runDir << "/run_info.txt\n";
 
-        // 3) streamline .bin: move into the run folder (keep) or delete. Assumes a
-        // shared filesystem -- the .bin workflow (all ranks writing into one
-        // outputDir) already requires that.
+        // 3) streamline .bin: move into the run folder (keep) or delete. Assumes
+        // a shared filesystem, as the .bin workflow already requires.
         int handled = 0;
         for (int gid = 0; gid < nblocks; ++gid) {
             const std::string bin = outputDir + "/" + std::to_string(gid) + ".bin";
@@ -404,11 +358,9 @@ inline void lic_read_bin_segments(const std::string& path, std::vector<LicSeg>& 
     }
 }
 
-// METHOD 1 (combine): rank 0 reads every <gid>.bin from the base outputDir,
-// reassembles the segments into whole streamlines (group by pid, order by sid,
-// drop the duplicated boundary point -- same as scripts/plot/read_traces.py), folds
-// those whole lines into the image, then writes (no image reduce -- rank 0 has the
-// whole picture). Rank 0 holds all the streamline data at once.
+// METHOD 1: rank 0 reads every <gid>.bin, reassembles whole streamlines (group by
+// pid, order by sid, drop the duplicated boundary point -- like read_traces.py),
+// folds them, then writes directly (no reduce -- rank 0 already has it all).
 inline void lic_combine_finish(LicRun& run, const std::string& configPath,
                                MPI_Comm comm = MPI_COMM_WORLD)
 {

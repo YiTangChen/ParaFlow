@@ -34,11 +34,9 @@
 #define LIC_PI 3.14159265358979323846
 #endif
 
-// =============================================================================
 // Equirectangular projection: a 3-D point on the Earth sphere -> pixel index.
 // lon = atan2(y,x), lat = asin(z/r) using each point's OWN radius r so the
 // latitude is depth-independent. Returns row*w + col.
-// =============================================================================
 inline int64_t lic_to_pixel_index(double x, double y, double z, int w, int h)
 {
     double r   = std::sqrt(x * x + y * y + z * z);
@@ -53,10 +51,8 @@ inline int64_t lic_to_pixel_index(double x, double y, double z, int w, int h)
     return int64_t(row) * w + col;
 }
 
-// =============================================================================
 // Minimal grayscale PNG writer: signature + IHDR + IDAT(zlib "stored") + IEND.
 // Needs no external libraries.
-// =============================================================================
 namespace lic_detail {
 
 inline uint32_t crc32_buf(const uint8_t* buf, size_t len)
@@ -151,11 +147,9 @@ inline bool lic_write_png_gray(const std::string& path, int w, int h, const uint
     return bool(f);
 }
 
-// =============================================================================
 // LIC image state: a white-noise map plus the two accumulators. The noise map
 // MUST be identical on every rank, so it is seeded deterministically — pass the
 // SAME (broadcast) seed on all ranks.
-// =============================================================================
 struct LicImage {
     int w, h;
     std::vector<double> noise;      // w*h, identical on every rank
@@ -174,11 +168,9 @@ struct LicImage {
     }
 };
 
-// =============================================================================
 // Fold ONE streamline/segment into the image, then the caller frees the trace.
 // pts3 is a flat [x,y,z, x,y,z, ...] array of length npts*3.
 // Stores PARTIAL sums; final pixels are computed in lic_to_gray AFTER reduce.
-// =============================================================================
 inline void lic_add_streamline(LicImage& img, const double* pts3, size_t npts)
 {
     if (npts == 0) return;
@@ -196,10 +188,8 @@ inline void lic_add_streamline(LicImage& img, const double* pts3, size_t npts)
     for (int64_t q : idx) { img.noise_sum[q] += mean; img.count[q] += 1.0; }
 }
 
-// =============================================================================
 // Finalize: produce an 8-bit grayscale image (call on the root rank AFTER the
 // reduce). Pixels untouched by any streamline stay black (0).
-// =============================================================================
 inline std::vector<uint8_t> lic_to_gray(const LicImage& img)
 {
     const size_t N = size_t(img.w) * size_t(img.h);
@@ -214,7 +204,6 @@ inline std::vector<uint8_t> lic_to_gray(const LicImage& img)
     return g;
 }
 
-// =============================================================================
 // Nearest-neighbor stretch of an 8-bit grayscale image from srcW x srcH to
 // dstW x dstH. Used to change the OUTPUT picture's aspect ratio (e.g. widen a
 // square LIC into a 2:1 world map) WITHOUT touching the resolution streamlines
@@ -222,7 +211,6 @@ inline std::vector<uint8_t> lic_to_gray(const LicImage& img)
 // own density, or pixels between seeds go untouched and render black (see
 // lic_add_streamline / lic_to_gray above). Stretching the finished image is a
 // plain resize, so it never introduces that artifact.
-// =============================================================================
 inline std::vector<uint8_t> lic_stretch_gray(const std::vector<uint8_t>& src,
                                              int srcW, int srcH, int dstW, int dstH)
 {
@@ -239,11 +227,9 @@ inline std::vector<uint8_t> lic_stretch_gray(const std::vector<uint8_t>& src,
     return out;
 }
 
-// =============================================================================
 // Regular lat/lon seeding on a sphere of the given radius (for "seeding: regular").
 // Returns a flat [x,y,z, ...] array of lon_count*lat_count seed points. Kept here
 // (VECTOR3-free) so the caller wraps these into its own seed type.
-// =============================================================================
 inline std::vector<double> lic_regular_sphere_seeds(
     int lon_count, int lat_count, double radius,
     double lon_min = -LIC_PI, double lon_max = LIC_PI,
@@ -267,10 +253,8 @@ inline std::vector<double> lic_regular_sphere_seeds(
     return seeds;
 }
 
-// =============================================================================
 // Optional MPI reduce of the accumulators onto `root`. Opt-in to keep this
 // header MPI-free for the standalone tool: #define LIC_WITH_MPI before include.
-// =============================================================================
 #ifdef LIC_WITH_MPI
 #include <mpi.h>
 inline void lic_reduce(LicImage& img, MPI_Comm comm, int root)
