@@ -23,12 +23,17 @@ pull new changes or edit anything under `ParaFlow/OSUFlow/`, rerun the first
 ## Run one dataset
 
 ```bash
-srun -n <nproc> --ntasks-per-node=4 --gpus-per-task=1 --mpi=pmi2 \
+srun -n <nproc> --ntasks-per-node=4 --gpus-per-task=1 --mpi=pmix \
   ./ParaFlow_lic_gpu conf/lic_streamline_gpu.yaml
 ```
 
-`<nproc>` must match `nproc`/`nblocks` in the config. `--mpi=pmi2` is
-required — without it Slurm won't form a single MPI job across ranks.
+`<nproc>` must match `nproc`/`nblocks` in the config. `--mpi=pmix` is
+required — without it (or with `--mpi=pmi2`, which this cluster's mvapich
+doesn't speak — check with `ldd ./ParaFlow_lic_gpu | grep pmi`) Slurm won't
+form a single MPI job across ranks: every task silently becomes its own
+singleton `rank=0 size=1` world, runs fine until the first cross-rank
+communication (DIY's `iexchange`), then aborts with `Invalid rank ... must be
+nonnegative and less than 1`.
 
 ## Run several datasets in one job
 

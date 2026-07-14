@@ -27,5 +27,8 @@ fi
 
 for cfg in "${CONFIGS[@]}"; do
     echo "==> Running ParaFlow_lic_gpu $cfg"
-    srun --export=ALL --mpi=pmi2 -n 16 --ntasks-per-node=4 --gpus-per-task=1 ./ParaFlow_lic_gpu "$cfg"
+    # --mpi=pmix (NOT pmi2): this cluster's mvapich links libpmix, not libpmi2 --
+    # pmi2 leaves every rank in its own singleton MPI_COMM_WORLD (see
+    # conf/lic_streamline_gpu.yaml's header comment for the failure mode).
+    srun --export=ALL --mpi=pmix -n 16 --ntasks-per-node=4 --gpus-per-task=1 ./ParaFlow_lic_gpu "$cfg"
 done

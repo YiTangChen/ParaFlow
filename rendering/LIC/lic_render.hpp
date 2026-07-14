@@ -184,19 +184,39 @@ inline bool lic_write_bin_to_disk(const std::string& configPath)
 }
 
 // A LIC run in progress: the accumulating image plus what the output step needs.
+// img is folded at the NATIVE resolution (matching the seed grid's own density,
+// so every pixel has a chance to be crossed by some streamline -- no black
+// stripes). stretchW/stretchH scale that finished image up at write time (see
+// lic_write_outputs) to reach the requested output aspect ratio.
 struct LicRun {
     LicImage    img;
     uint64_t    seed = 0;
     std::string mode = "cpu";
     long        folded = 0;        // traces folded so far (for logging)
+    int         stretchW = 1;
+    int         stretchH = 1;
     LicRun(int w, int h, uint64_t s, std::string m)
         : img(w, h, s), seed(s), mode(std::move(m)) {}
 };
 
-// Start a run: build the noise image. Reads lic_width/lic_height/lic_seed; auto-
-// sizes from nSeeds when width/height are 0. The noise map is IDENTICAL on every
-// rank (config seed, or a fresh seed drawn by rank 0 and broadcast). `mode`
-// ("gpu"/"cpu") is remembered only to name the output folder.
+// Start a run: build the noise image. Reads lic_seed, then picks the NATIVE
+// resolution the streamlines fold into:
+//   1) seed_width/seed_height (recommended) -> the noise/fold image is sized to
+//      exactly match the seed grid's own density, so every pixel is reachable by
+//      some streamline. lic_ratio_w/lic_ratio_h (default 1:1) then just STRETCH
+//      the finished image to seed_width*ratioW x seed_height*ratioH at write time
+//      (lic_write_outputs) -- a plain resize, not a change in fold density, so it
+//      never introduces black stripes. e.g. seed_width/height: 256, lic_ratio_w: 2,
+//      lic_ratio_h: 1 folds at 256x256 and stretches the output to 512x256.
+//   2) lic_width/lic_height (legacy, no seed_width/height set) -> used as the
+//      native fold resolution directly, no stretch. You are responsible for
+//      keeping these <= the seed grid's actual resolution per dimension;
+//      exceeding it reintroduces the stripe artifact.
+//   3) neither -> auto-size from nSeeds, assuming an N*N (square) or (2N)*N (2:1)
+//      seed grid.
+// The noise map is IDENTICAL on every rank (config seed, or a fresh seed drawn by
+// rank 0 and broadcast). `mode` ("gpu"/"cpu") is remembered only to name the
+// output folder.
 inline LicRun lic_begin(const std::string& configPath, size_t nSeeds,
                         const std::string& mode = "cpu", MPI_Comm comm = MPI_COMM_WORLD)
 {
@@ -223,22 +243,45 @@ inline LicRun lic_begin(const std::string& configPath, size_t nSeeds,
         std::cerr << "[lic] noise seed = " << licSeed
                   << (config["lic_seed"] ? " (from config)" : " (random per run)") << "\n";
 
-    // Resolution: one pixel per seed unless the config forced a size. Seed grids
-    // are N*N (square) or (2N)*N (2:1).
-    if (licW <= 0 || licH <= 0) {
-        const size_t n = nSeeds;
-        const size_t s = size_t(std::llround(std::sqrt(double(n))));
-        if (s > 0 && s * s == n) { licW = int(s); licH = int(s); }                    // N x N
-        else {
-            const size_t s2 = size_t(std::llround(std::sqrt(double(n) / 2.0)));
-            if (s2 > 0 && 2 * s2 * s2 == n) { licW = int(2 * s2); licH = int(s2); }    // 2N x N
-            else { licW = 2048; licH = 1024; }                                        // fallback
-        }
+    const bool haveSeedRes = config["seed_width"]  && !config["seed_width"].IsNull()
+                           && config["seed_height"] && !config["seed_height"].IsNull();
+
+    int stretchW = config["lic_ratio_w"] && !config["lic_ratio_w"].IsNull()
+                 ? config["lic_ratio_w"].as<int>() : 1;
+    int stretchH = config["lic_ratio_h"] && !config["lic_ratio_h"].IsNull()
+                 ? config["lic_ratio_h"].as<int>() : 1;
+    if (stretchW < 1) stretchW = 1;
+    if (stretchH < 1) stretchH = 1;
+
+    if (haveSeedRes) {
+        licW = config["seed_width"].as<int>();
+        licH = config["seed_height"].as<int>();
         if (rank == 0)
-            std::cerr << "[lic] auto resolution " << licW << "x" << licH
-                      << " from " << n << " seeds\n";
+            std::cerr << "[lic] fold resolution " << licW << "x" << licH
+                      << " (seed grid), output stretched to "
+                      << licW * stretchW << "x" << licH * stretchH << "\n";
+    } else {
+        stretchW = stretchH = 1;    // no seed grid given -> no stretch, legacy behavior
+        if (licW <= 0 || licH <= 0) {
+            // Resolution: one pixel per seed unless the config forced a size. Seed
+            // grids are N*N (square) or (2N)*N (2:1).
+            const size_t n = nSeeds;
+            const size_t s = size_t(std::llround(std::sqrt(double(n))));
+            if (s > 0 && s * s == n) { licW = int(s); licH = int(s); }                    // N x N
+            else {
+                const size_t s2 = size_t(std::llround(std::sqrt(double(n) / 2.0)));
+                if (s2 > 0 && 2 * s2 * s2 == n) { licW = int(2 * s2); licH = int(s2); }    // 2N x N
+                else { licW = 2048; licH = 1024; }                                        // fallback
+            }
+            if (rank == 0)
+                std::cerr << "[lic] auto resolution " << licW << "x" << licH
+                          << " from " << n << " seeds\n";
+        }
     }
-    return LicRun(licW, licH, licSeed, mode);
+    LicRun run(licW, licH, licSeed, mode);
+    run.stretchW = stretchW;
+    run.stretchH = stretchH;
+    return run;
 }
 
 // Fold one batch of streamlines into the run image (used by METHOD 2, once per
@@ -274,14 +317,19 @@ inline void lic_write_outputs(LicRun& run, const std::string& configPath,
 
     if (rank == 0) {
         namespace fs = std::filesystem;
-        const int licW = run.img.w, licH = run.img.h;
+        const int foldW = run.img.w, foldH = run.img.h;
+        const int licW = foldW * run.stretchW, licH = foldH * run.stretchH;
 
         const std::string runDir = outputDir + "/" + lic_run_label(run.mode, configPath);
         fs::create_directories(runDir);
 
-        // 1) the LIC image
+        // 1) the LIC image: fold at native (seed-matched) resolution, then stretch
+        // to the requested output size (lic_ratio_w/h) -- a plain resize, so it
+        // cannot introduce the black-stripe artifact a finer fold would.
         const std::string pngPath = runDir + "/lic.png";
         std::vector<uint8_t> gray = lic_to_gray(run.img);
+        if (run.stretchW != 1 || run.stretchH != 1)
+            gray = lic_stretch_gray(gray, foldW, foldH, licW, licH);
         if (lic_write_png_gray(pngPath, licW, licH, gray.data()))
             std::cerr << "[lic] wrote " << pngPath << " (" << licW << "x" << licH << ")\n";
         else

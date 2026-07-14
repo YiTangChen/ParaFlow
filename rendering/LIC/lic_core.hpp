@@ -215,6 +215,31 @@ inline std::vector<uint8_t> lic_to_gray(const LicImage& img)
 }
 
 // =============================================================================
+// Nearest-neighbor stretch of an 8-bit grayscale image from srcW x srcH to
+// dstW x dstH. Used to change the OUTPUT picture's aspect ratio (e.g. widen a
+// square LIC into a 2:1 world map) WITHOUT touching the resolution streamlines
+// were folded at -- that fold resolution must stay matched to the seed grid's
+// own density, or pixels between seeds go untouched and render black (see
+// lic_add_streamline / lic_to_gray above). Stretching the finished image is a
+// plain resize, so it never introduces that artifact.
+// =============================================================================
+inline std::vector<uint8_t> lic_stretch_gray(const std::vector<uint8_t>& src,
+                                             int srcW, int srcH, int dstW, int dstH)
+{
+    std::vector<uint8_t> out(size_t(dstW) * size_t(dstH));
+    for (int y = 0; y < dstH; ++y) {
+        int sy = int(size_t(y) * srcH / dstH); sy = sy >= srcH ? srcH - 1 : sy;
+        const uint8_t* srow = src.data() + size_t(sy) * srcW;
+        uint8_t* drow = out.data() + size_t(y) * dstW;
+        for (int x = 0; x < dstW; ++x) {
+            int sx = int(size_t(x) * srcW / dstW); sx = sx >= srcW ? srcW - 1 : sx;
+            drow[x] = srow[sx];
+        }
+    }
+    return out;
+}
+
+// =============================================================================
 // Regular lat/lon seeding on a sphere of the given radius (for "seeding: regular").
 // Returns a flat [x,y,z, ...] array of lon_count*lat_count seed points. Kept here
 // (VECTOR3-free) so the caller wraps these into its own seed type.
