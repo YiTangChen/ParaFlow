@@ -12,13 +12,9 @@
 # then set nproc=nblocks=N and graph_partition_indices below to match.
 #
 # Launch inside the salloc (or via jobs/osc_lic_batch_gpu.sh for multiple datasets):
+#   export LD_LIBRARY_PATH=/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/netcdf-cxx4/gcc/12.3.0/mvapich/3.0/4.3.1-tgr36hp/lib64:${LD_LIBRARY_PATH}
 #   srun -n 8 --ntasks-per-node=4 --gpus-per-task=1 --mpi=pmix ./ParaFlow_lic_gpu conf/lic_streamline_gpu.yaml
-# --mpi=pmix (NOT pmi2): this cluster's mvapich is linked against libpmix, not
-# libpmi2 (check with `ldd ./ParaFlow_lic_gpu | grep pmi`). Using --mpi=pmi2
-# here means Slurm and MPI never agree on a rendezvous protocol, so every rank
-# silently falls back to its own singleton MPI_COMM_WORLD (rank=0, size=1) --
-# everything runs fine until the first real cross-rank op (DIY's iexchange),
-# which then aborts with "Invalid rank ... must be nonnegative and less than 1".
+# (LD_LIBRARY_PATH needed because libnetcdf-cxx4.so has no rpath -- see rendering/LIC/README.md)
 
 enable_timing: false
 outputDir: lic_output_gpu_debug         # lic.png lands here

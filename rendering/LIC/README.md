@@ -23,9 +23,15 @@ pull new changes or edit anything under `ParaFlow/OSUFlow/`, rerun the first
 ## Run one dataset
 
 ```bash
+export LD_LIBRARY_PATH=/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/netcdf-cxx4/gcc/12.3.0/mvapich/3.0/4.3.1-tgr36hp/lib64:${LD_LIBRARY_PATH}
 srun -n <nproc> --ntasks-per-node=4 --gpus-per-task=1 --mpi=pmix \
   ./ParaFlow_lic_gpu conf/lic_streamline_gpu.yaml
 ```
+
+The `LD_LIBRARY_PATH` export is required — `build_lic_gpu.sh` links
+`libnetcdf-cxx4.so` by absolute path with no rpath, so without it you'll hit
+`error while loading shared libraries: libnetcdf-cxx4.so.1: cannot open
+shared object file`. (`jobs/osc_lic_batch_gpu.sh` already sets this for you.)
 
 `<nproc>` must match `nproc`/`nblocks` in the config. `--mpi=pmix` is
 required — without it (or with `--mpi=pmi2`, which this cluster's mvapich
