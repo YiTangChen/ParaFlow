@@ -376,6 +376,33 @@ struct Block
         }
         if (writeToDisk) outfile.close();
     }
+
+    // Serialize this block's segments into the SAME wire format write_trajectory
+    // writes to a file (repeated [pid][gid][sid][nPts][xyz]*nPts), but appended
+    // to an in-memory buffer instead. Used by LIC combine mode
+    // (rendering/LIC/lic_render.hpp lic_gather_segments) to MPI-gather segments
+    // straight to rank 0 without any rank ever touching disk.
+    void append_trajectory_bytes(std::vector<char>& buf) const {
+        auto put = [&buf](const void* p, size_t n) {
+            const char* c = (const char*)p;
+            buf.insert(buf.end(), c, c + n);
+        };
+        for (size_t segidx = 0; segidx < segs.size(); ++segidx) {
+            const int pid  = segs[segidx].pid;
+            const int gid  = segs[segidx].gid;
+            const int sid  = segs[segidx].sid;
+            const int nPts = (int)segs[segidx].coords.size();
+            put(&pid, sizeof(int));
+            put(&gid, sizeof(int));
+            put(&sid, sizeof(int));
+            put(&nPts, sizeof(int));
+            for (int ptidx = 0; ptidx < nPts; ++ptidx) {
+                put(&(segs[segidx].coords[ptidx][0]), sizeof(double));
+                put(&(segs[segidx].coords[ptidx][1]), sizeof(double));
+                put(&(segs[segidx].coords[ptidx][2]), sizeof(double));
+            }
+        }
+    }
 };
 
 #endif

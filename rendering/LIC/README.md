@@ -22,24 +22,43 @@ pull new changes or edit anything under `ParaFlow/OSUFlow/`, rerun the first
 
 ## Run one dataset
 
+The launch flags differ per cluster — the binary this repo builds by default is
+for **OSC Cardinal**.
+
+### OSC Cardinal (MVAPICH + spack NetCDF)
+
 ```bash
 export LD_LIBRARY_PATH=/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/netcdf-cxx4/gcc/12.3.0/mvapich/3.0/4.3.1-tgr36hp/lib64:${LD_LIBRARY_PATH}
-srun -n <nproc> --ntasks-per-node=4 --gpus-per-task=1 --mpi=pmix \
+srun -n <nproc> --ntasks-per-node=4 --gpus-per-task=1 --mpi=pmi2 \
   ./ParaFlow_lic_gpu conf/lic_streamline_gpu.yaml
 ```
 
-The `LD_LIBRARY_PATH` export is required — `build_lic_gpu.sh` links
-`libnetcdf-cxx4.so` by absolute path with no rpath, so without it you'll hit
-`error while loading shared libraries: libnetcdf-cxx4.so.1: cannot open
-shared object file`. (`jobs/osc_lic_batch_gpu.sh` already sets this for you.)
+`LD_LIBRARY_PATH` is required (`build_lic_gpu.sh` links `libnetcdf-cxx4.so` with
+no rpath; `jobs/osc_lic_batch_gpu.sh` already sets it). `<nproc>` must match
+`nproc`/`nblocks` in the config. `--mpi=pmi2` is required — this binary links
+Slurm's PMI client, not `libpmix` (confirm with `ldd ./ParaFlow_lic_gpu | grep
+pmi`); with `--mpi=pmix` every rank becomes a singleton `rank=0 size=1` world
+and aborts at the first cross-rank op with `Invalid rank ...`.
 
-`<nproc>` must match `nproc`/`nblocks` in the config. `--mpi=pmix` is
-required — without it (or with `--mpi=pmi2`, which this cluster's mvapich
-doesn't speak — check with `ldd ./ParaFlow_lic_gpu | grep pmi`) Slurm won't
-form a single MPI job across ranks: every task silently becomes its own
-singleton `rank=0 size=1` world, runs fine until the first cross-rank
-communication (DIY's `iexchange`), then aborts with `Invalid rank ... must be
-nonnegative and less than 1`.
+### NERSC Perlmutter (Cray MPICH + Cray NetCDF)
+
+Rebuild for the Cray toolchain first (the default binary is Cardinal-linked and
+won't run here):
+
+```bash
+./switch.sh nersc
+OSUFLOW_ENABLE_CUDA=1 CUDA_ARCH=80 bash build.sh   # A100 = arch 80
+bash rendering/LIC/build_lic_gpu.sh
+```
+
+Then launch — no `LD_LIBRARY_PATH` export (the NetCDF module sets it) and no
+`--mpi` flag (Cray MPICH speaks Perlmutter's default PMI natively):
+
+```bash
+export MPICH_GPU_SUPPORT_ENABLED=0      # binary not linked with libmpi_gtl_cuda
+srun -n <nproc> --ntasks-per-node=4 --gpus-per-task=1 --gpu-bind=closest \
+  ./ParaFlow_lic_gpu conf/lic_streamline_gpu.yaml
+```
 
 ## Run several datasets in one job
 
@@ -61,9 +80,10 @@ manifest.
 - **`lic_width`** / **`lic_height`**: output image resolution.
 - **`nproc`** / **`nblocks`** / **`graph_partition_indices`**: how many
   ranks/GPUs to use — must match each other and your `srun -n`.
-- **`streamline_storage`**: `memory` (default) keeps everything in RAM and
-  writes nothing but the final PNG; `disk` also keeps the raw per-block
-  trajectory files for later reuse.
+- **`streamline_storage`**: segments are gathered to rank 0 over MPI (no rank
+  writes a `.bin` during tracing). `memory` (default) drops them once folded —
+  only the final PNG; `disk` writes the reassembled trajectories as `<gid>.bin`
+  in the run folder for later reuse (e.g. `scripts/plot/read_traces.py`).
 - **`outputDir`**: where results land, in a subfolder named after the mode,
   direction, and dataset — so different datasets/directions don't overwrite
   each other, but two runs of the *same* dataset/direction will.

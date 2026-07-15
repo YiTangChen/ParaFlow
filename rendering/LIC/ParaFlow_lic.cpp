@@ -10,12 +10,9 @@
 // `useGPU: false` in the config (see ParaFlow_lic_gpu.cpp for the GPU counterpart).
 //
 // Both directions are traced so the LIC line runs THROUGH each seed (config key
-// lic_direction: forward | backward | both).
-//
-// Two strategies, chosen by config key `lic_combine` (for A/B comparison):
-//   false = fold each direction's per-block SEGMENTS locally, reduce the images
-//   true  = rank 0 reads the <gid>.bin files, reassembles whole streamlines
-//           (read_traces.py logic), and folds those  [use a single direction]
+// lic_direction: forward | backward | both). Each rank's segments are gathered
+// straight to rank 0 over MPI (never written to disk), which reassembles whole
+// streamlines (read_traces.py logic) and folds those.
 //
 // Build:  bash rendering/LIC/build_lic.sh
 // Run:    mpirun -np <nproc> ./ParaFlow_lic conf/lic_streamline.yaml
@@ -40,30 +37,19 @@ int main(int argc, char *argv[])
 
     LicRun run = lic_begin(argv[1], lic_count_seeds(argv[1]), "cpu");
 
-    if (lic_combine(argv[1])) {
-        // METHOD 1 (combine): generate (writes per-block <gid>.bin), then rank 0
-        // reassembles those into whole streamlines and folds. The in-memory copy is
-        // unused here, so drop it after each direction to keep memory down.
-        std::list<std::vector<VECTOR3>> discard;
-        for (double sign : lic_directions(argv[1], rank)) {
-            pf.GenStreamLines(discard, sign);        // run streamline (outside rendering)
-            discard.clear();
-        }
-        lic_combine_finish(run, argv[1]);
-    } else {
-        // METHOD 2 (no combine): fold each direction's segments locally, reduce images.
-        // streamline_storage: memory -> the traces live ONLY here, in RAM (writeBin=false
-        // skips the <gid>.bin write entirely, see block.hpp write_trajectory): fold them
-        // into the image and free them immediately, so peak memory is ONE direction's
-        // traces (not both) and nothing ever touches disk.
-        const bool writeBin = lic_write_bin_to_disk(argv[1]);
-        for (double sign : lic_directions(argv[1], rank)) {
-            std::list<std::vector<VECTOR3>> sls;
-            pf.GenStreamLines(sls, sign, writeBin);  // run streamline (outside rendering)
-            lic_fold(run, sls);                      // fold this direction ...
-            sls.clear();                             // ... then free it before the next one
-        }
-        lic_finish(run, argv[1]);
+    // Generate (writeToDisk=false -- never touches disk), gather each direction's
+    // segments straight to rank 0 over MPI, then reassemble those into whole
+    // streamlines and fold. The in-memory point-list copy is unused here
+    // (segBytesOut carries the pid/sid-tagged data lic_finish actually needs),
+    // so drop it after each direction to keep memory down.
+    std::list<std::vector<VECTOR3>> discard;
+    std::vector<LicSeg> fwdSegs, bwdSegs;
+    for (double sign : lic_directions(argv[1], rank)) {
+        std::vector<char> localBytes;
+        pf.GenStreamLines(discard, sign, false, &localBytes);   // run streamline (outside rendering)
+        discard.clear();
+        lic_gather_segments(localBytes, sign < 0.0 ? bwdSegs : fwdSegs);
     }
+    lic_finish(run, argv[1], fwdSegs, bwdSegs);
     return 0;
 }

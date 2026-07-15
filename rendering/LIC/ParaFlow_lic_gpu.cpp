@@ -52,30 +52,19 @@ int main(int argc, char *argv[])
 
     LicRun run = lic_begin(argv[1], lic_count_seeds(argv[1]), "gpu");
 
-    if (lic_combine(argv[1])) {
-        // METHOD 1 (combine): generate on the GPU (writes per-block <gid>.bin), then
-        // rank 0 reassembles those into whole streamlines and folds. In-memory copy
-        // unused here, so drop it after each direction.
-        std::list<std::vector<VECTOR3>> discard;
-        for (double sign : lic_directions(argv[1], rank)) {
-            pf.GenStreamLines(discard, sign);        // run streamline (outside rendering)
-            discard.clear();
-        }
-        lic_combine_finish(run, argv[1]);
-    } else {
-        // METHOD 2 (no combine): fold each direction's segments locally, reduce images.
-        // streamline_storage: memory -> the traces live ONLY here, in RAM (writeBin=false
-        // skips the <gid>.bin write entirely, see block.hpp write_trajectory): fold them
-        // into the image and free them immediately, so peak memory is ONE direction's
-        // traces (not both) and nothing ever touches disk.
-        const bool writeBin = lic_write_bin_to_disk(argv[1]);
-        for (double sign : lic_directions(argv[1], rank)) {
-            std::list<std::vector<VECTOR3>> sls;
-            pf.GenStreamLines(sls, sign, writeBin);  // run streamline (outside rendering)
-            lic_fold(run, sls);                      // fold this direction ...
-            sls.clear();                             // ... then free it before the next one
-        }
-        lic_finish(run, argv[1]);
+    // Generate on the GPU (writeToDisk=false -- never touches disk), gather each
+    // direction's segments straight to rank 0 over MPI, then reassemble those
+    // into whole streamlines and fold. In-memory point-list copy unused here
+    // (segBytesOut carries the pid/sid-tagged data lic_finish actually needs),
+    // so drop it after each direction.
+    std::list<std::vector<VECTOR3>> discard;
+    std::vector<LicSeg> fwdSegs, bwdSegs;
+    for (double sign : lic_directions(argv[1], rank)) {
+        std::vector<char> localBytes;
+        pf.GenStreamLines(discard, sign, false, &localBytes);   // run streamline (outside rendering)
+        discard.clear();
+        lic_gather_segments(localBytes, sign < 0.0 ? bwdSegs : fwdSegs);
     }
+    lic_finish(run, argv[1], fwdSegs, bwdSegs);
     return 0;
 }

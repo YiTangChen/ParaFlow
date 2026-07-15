@@ -18,6 +18,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <chrono>
 #include <filesystem>
@@ -99,25 +100,14 @@ inline std::string lic_run_label(const std::string& mode, const std::string& con
     return mode + "_" + d + "_" + dataName;
 }
 
-// Folding strategy (config `lic_combine`), for A/B comparison:
-//   false = METHOD 2: each rank folds its own segments locally, then the images
-//           are summed (lic_reduce) -- each fragment's footprint averaged alone.
-//   true  = METHOD 1: rank 0 reassembles whole streamlines from <gid>.bin (like
-//           read_traces.py) and folds those -- each whole line averaged as one.
-// Different images by design. NOTE: <gid>.bin is per-direction, so combine only
-// reflects the LAST traced direction -- use forward/backward for a clean compare.
-inline bool lic_combine(const std::string& configPath)
-{
-    YAML::Node config = YAML::LoadFile(configPath);
-    return config["lic_combine"] && config["lic_combine"].as<bool>();
-}
-
-// Where traces end up (config `streamline_storage`):
-//   memory = fold from RAM, then DELETE <gid>.bin -- only the PNG remains.
+// Where traces end up (config `streamline_storage`): rank 0 reassembles whole
+// streamlines from <gid>.bin (GenStreamLines always writes it -- no fill-only
+// path), so the file exists regardless; this only controls what happens to it
+// afterward.
+//   memory = DELETE <gid>.bin once folded -- only the PNG remains.
 //   disk   = KEEP <gid>.bin in the run folder for later reuse (read_traces.py, ...).
-// `memory` still writes <gid>.bin transiently: GenStreamLines always calls
-// write_trajectory, which has no fill-only path. Point outputDir at tmpfs (e.g.
-// /dev/shm/lic_run) to keep that write off real disk too.
+// Point outputDir at tmpfs (e.g. /dev/shm/lic_run) to keep the transient write
+// off real disk too.
 // Back-compat: falls back to bool `keep_streamline_bin` if the key is absent.
 inline bool lic_keep_bin(const std::string& configPath, int rank = 0)
 {
@@ -137,19 +127,6 @@ inline bool lic_keep_bin(const std::string& configPath, int rank = 0)
         return false;
     }
     return config["keep_streamline_bin"] && config["keep_streamline_bin"].as<bool>();
-}
-
-// Whether GenStreamLines should write <gid>.bin at all. Only meaningful for
-// METHOD 2 -- METHOD 1 always needs the file. Absent key -> true (write).
-inline bool lic_write_bin_to_disk(const std::string& configPath)
-{
-    YAML::Node config = YAML::LoadFile(configPath);
-    if (!config["streamline_storage"] || config["streamline_storage"].IsNull())
-        return true;
-    std::string s = config["streamline_storage"].as<std::string>();
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c){ return (char)std::tolower(c); });
-    return (s == "disk" || s == "storage");   // memory (or unrecognized) -> skip write
 }
 
 // A run in progress: the accumulating image plus output-step state. img folds at
@@ -243,23 +220,75 @@ inline LicRun lic_begin(const std::string& configPath, size_t nSeeds,
     return run;
 }
 
-// Fold one batch of streamlines into the run image (METHOD 2, once per direction).
-// VECTOR3 is 3 contiguous doubles, so vector<VECTOR3> reinterpret-casts straight
-// to the flat array lic_add_streamline wants.
-inline void lic_fold(LicRun& run, const std::list<std::vector<VECTOR3>>& streamlines)
+// One streamline segment (coords flattened xyz), gathered directly from a
+// rank's in-memory buffer (see lic_gather_segments) -- never read from a file.
+struct LicSeg { int pid = 0, gid = 0, sid = 0; std::vector<double> xyz; };
+
+// Parse the wire format Block::append_trajectory_bytes / write_trajectory both
+// use: repeated [int32 pid][int32 gid][int32 sid][int32 nPts][float64 xyz]*nPts.
+// Appends each segment to `out`. (Little-endian host, matching the writer.)
+inline void lic_parse_segments(const char* data, size_t len, std::vector<LicSeg>& out)
 {
-    for (const auto& tr : streamlines) {
-        if (tr.empty()) continue;
-        lic_add_streamline(run.img, reinterpret_cast<const double*>(tr.data()), tr.size());
+    size_t off = 0;
+    while (off + 4 * sizeof(int) <= len) {
+        int hdr[4];
+        std::memcpy(hdr, data + off, sizeof(hdr));
+        off += sizeof(hdr);
+        const int pid = hdr[0], gid = hdr[1], sid = hdr[2], nPts = hdr[3];
+        if (nPts < 0) break;
+        const size_t want = (size_t)nPts * 3 * sizeof(double);
+        if (off + want > len) break;                              // truncated tail
+        LicSeg s; s.pid = pid; s.gid = gid; s.sid = sid;
+        s.xyz.resize((size_t)nPts * 3);
+        std::memcpy(s.xyz.data(), data + off, want);
+        off += want;
+        out.push_back(std::move(s));
     }
-    run.folded += (long)streamlines.size();
 }
 
-// Rank-0 output step, shared by both methods: create <outputDir>/<mode>_
-// <direction>_<datafile>/, write lic.png + run_info.txt (a config copy), then
-// move-or-delete the per-block <gid>.bin files GenStreamLines left behind.
+// MPI-gather one direction's segments (already serialized locally by
+// GenStreamLines's segBytesOut) straight to rank 0 and parse them there -- no
+// rank ever writes a file. `out` is only populated on rank 0.
+inline void lic_gather_segments(const std::vector<char>& localBytes,
+                                std::vector<LicSeg>& out,
+                                MPI_Comm comm = MPI_COMM_WORLD)
+{
+    int rank = 0, nranks = 1;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &nranks);
+
+    const int localSize = (int)localBytes.size();
+    std::vector<int> sizes(rank == 0 ? nranks : 0);
+    MPI_Gather(&localSize, 1, MPI_INT, sizes.data(), 1, MPI_INT, 0, comm);
+
+    std::vector<int> displs;
+    std::vector<char> allBytes;
+    if (rank == 0) {
+        displs.resize(nranks);
+        int total = 0;
+        for (int r = 0; r < nranks; ++r) { displs[r] = total; total += sizes[r]; }
+        allBytes.resize(total);
+    }
+    MPI_Gatherv(localBytes.data(), localSize, MPI_CHAR,
+                rank == 0 ? allBytes.data() : nullptr,
+                rank == 0 ? sizes.data()    : nullptr,
+                rank == 0 ? displs.data()   : nullptr,
+                MPI_CHAR, 0, comm);
+
+    if (rank == 0) lic_parse_segments(allBytes.data(), allBytes.size(), out);
+}
+
+// Rank-0 output step: create <outputDir>/<mode>_<direction>_<datafile>/, write
+// lic.png + run_info.txt (a config copy), then -- only if streamline_storage:
+// disk asked for it -- write the gathered segments out as <gid>.bin (both
+// directions merged per gid, same wire format read_traces.py already expects,
+// so it needs no changes). With streamline_storage: memory (default) the
+// segments only ever existed in RAM (moved rank-to-rank via MPI, never a
+// file), so there's nothing to clean up -- they're just dropped here.
 // Assumes run.img already holds the FINAL image on rank 0.
 inline void lic_write_outputs(LicRun& run, const std::string& configPath,
+                              const std::vector<LicSeg>& fwdSegs,
+                              const std::vector<LicSeg>& bwdSegs,
                               MPI_Comm comm = MPI_COMM_WORLD)
 {
     int rank = 0;
@@ -269,7 +298,6 @@ inline void lic_write_outputs(LicRun& run, const std::string& configPath,
     const std::string outputDir = (config["outputDir"] && !config["outputDir"].IsNull())
                                   ? config["outputDir"].as<std::string>() : "lic_output";
     const bool keepBin = lic_keep_bin(configPath, rank);   // streamline_storage: memory|disk
-    const int  nblocks = config["nblocks"] ? config["nblocks"].as<int>() : 0;
 
     if (rank == 0) {
         namespace fs = std::filesystem;
@@ -305,99 +333,112 @@ inline void lic_write_outputs(LicRun& run, const std::string& configPath,
         }
         std::cerr << "[lic] wrote " << runDir << "/run_info.txt\n";
 
-        // 3) streamline .bin: move into the run folder (keep) or delete. Assumes
-        // a shared filesystem, as the .bin workflow already requires.
-        int handled = 0;
-        for (int gid = 0; gid < nblocks; ++gid) {
-            const std::string bin = outputDir + "/" + std::to_string(gid) + ".bin";
-            std::error_code ec;
-            if (!fs::exists(bin, ec)) continue;
-            if (keepBin) fs::rename(bin, runDir + "/" + std::to_string(gid) + ".bin", ec);
-            else         fs::remove(bin, ec);
-            if (!ec) ++handled;
+        // 3) streamline .bin: only written if streamline_storage: disk asked for
+        // it. Segments never touched a filesystem before this point (they moved
+        // rank-to-rank over MPI -- see lic_gather_segments), so `memory` mode
+        // means literally zero streamline bytes ever hit storage.
+        if (keepBin) {
+            std::unordered_map<int, std::vector<const LicSeg*>> byGid;
+            for (const auto& s : fwdSegs) byGid[s.gid].push_back(&s);
+            for (const auto& s : bwdSegs) byGid[s.gid].push_back(&s);
+            for (auto& kv : byGid) {
+                std::ofstream out(runDir + "/" + std::to_string(kv.first) + ".bin", std::ios::binary);
+                for (const LicSeg* s : kv.second) {
+                    const int nPts = (int)(s->xyz.size() / 3);
+                    out.write((const char*)&s->pid, sizeof(int));
+                    out.write((const char*)&s->gid, sizeof(int));
+                    out.write((const char*)&s->sid, sizeof(int));
+                    out.write((const char*)&nPts,   sizeof(int));
+                    out.write((const char*)s->xyz.data(), (std::streamsize)(s->xyz.size() * sizeof(double)));
+                }
+            }
+            std::cerr << "[lic] streamline .bin written to run folder (" << byGid.size() << " blocks)\n";
+        } else {
+            std::cerr << "[lic] streamline_storage: memory -- .bin never touched disk\n";
         }
-        std::cerr << "[lic] streamline .bin " << (keepBin ? "moved into run folder" : "deleted")
-                  << " (" << handled << "/" << nblocks << " blocks)\n";
     }
 
     MPI_Barrier(comm);   // no rank reaches MPI_Finalize until rank 0 finished writing
 }
 
-// METHOD 2 (no combine): reduce the per-rank images onto rank 0, then write.
+// Concatenate one direction's pid-ordered segments (sorted by sid ascending)
+// into a single polyline: segment 0 starts at the seed, each later segment
+// drops its first point (it repeats the previous segment's last -- the
+// block-boundary crossing point). Same rule read_traces.py uses.
+inline std::vector<double> lic_build_line(const std::vector<LicSeg>& segs,
+                                          const std::vector<size_t>& idxs)
+{
+    std::vector<double> line;
+    for (size_t k = 0; k < idxs.size(); ++k) {
+        const std::vector<double>& xyz = segs[idxs[k]].xyz;
+        const size_t startDbl = (k == 0) ? 0 : 3;   // skip 1 duplicated point
+        if (xyz.size() > startDbl)
+            line.insert(line.end(), xyz.begin() + startDbl, xyz.end());
+    }
+    return line;
+}
+
+// Reassemble whole streamlines from already-gathered segments (see
+// lic_gather_segments -- rank 0 only, everyone else's vectors are empty),
+// fold them, then write outputs (no reduce -- rank 0 already has it all).
 inline void lic_finish(LicRun& run, const std::string& configPath,
+                       const std::vector<LicSeg>& fwdSegs,
+                       const std::vector<LicSeg>& bwdSegs,
                        MPI_Comm comm = MPI_COMM_WORLD)
 {
     int rank = 0;
     MPI_Comm_rank(comm, &rank);
-    if (rank == 0) std::cerr << "[lic] folded " << run.folded << " local traces\n";
-    lic_reduce(run.img, comm, 0);          // combine per-rank IMAGES
-    lic_write_outputs(run, configPath, comm);
-}
-
-// One streamline segment read back from a <gid>.bin file (coords flattened xyz).
-struct LicSeg { int pid = 0, sid = 0; std::vector<double> xyz; };
-
-// Read one <gid>.bin (format written by block.hpp write_trajectory):
-//   repeated: [int32 pid][int32 gid][int32 sid][int32 nPts][float64 xyz]*nPts
-// Appends each segment to `out`. (Little-endian host, matching the writer.)
-inline void lic_read_bin_segments(const std::string& path, std::vector<LicSeg>& out)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return;
-    while (true) {
-        int hdr[4];
-        f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
-        if (f.gcount() < (std::streamsize)sizeof(hdr)) break;      // clean EOF
-        const int pid = hdr[0], sid = hdr[2], nPts = hdr[3];
-        if (nPts < 0) break;
-        LicSeg s; s.pid = pid; s.sid = sid; s.xyz.resize((size_t)nPts * 3);
-        const std::streamsize want = (std::streamsize)nPts * 3 * (std::streamsize)sizeof(double);
-        f.read(reinterpret_cast<char*>(s.xyz.data()), want);
-        if (f.gcount() < want) break;                              // truncated tail
-        out.push_back(std::move(s));
-    }
-}
-
-// METHOD 1: rank 0 reads every <gid>.bin, reassembles whole streamlines (group by
-// pid, order by sid, drop the duplicated boundary point -- like read_traces.py),
-// folds them, then writes directly (no reduce -- rank 0 already has it all).
-inline void lic_combine_finish(LicRun& run, const std::string& configPath,
-                               MPI_Comm comm = MPI_COMM_WORLD)
-{
-    int rank = 0;
-    MPI_Comm_rank(comm, &rank);
-    YAML::Node config = YAML::LoadFile(configPath);
-    const std::string outputDir = (config["outputDir"] && !config["outputDir"].IsNull())
-                                  ? config["outputDir"].as<std::string>() : "lic_output";
-    const int nblocks = config["nblocks"] ? config["nblocks"].as<int>() : 0;
 
     if (rank == 0) {
-        // 1) read all per-block segment files
-        std::vector<LicSeg> segs;
-        for (int gid = 0; gid < nblocks; ++gid)
-            lic_read_bin_segments(outputDir + "/" + std::to_string(gid) + ".bin", segs);
-        std::cerr << "[lic] read " << segs.size() << " segments from " << nblocks << " block files\n";
+        std::cerr << "[lic] gathered " << fwdSegs.size() << " forward + " << bwdSegs.size()
+                  << " backward segments (in RAM, no disk)\n";
 
-        // 2) group segment indices by pid
-        std::unordered_map<int, std::vector<size_t>> byPid;
-        for (size_t i = 0; i < segs.size(); ++i)
-            byPid[segs[i].pid].push_back(i);
+        // Group each direction's segment indices by pid, ordered by sid. Each
+        // direction's sid restarts at 0 from the shared seed, so a fwd segment
+        // and a bwd segment can share the same sid -- fwdSegs/bwdSegs must stay
+        // separate groupings, never merged into one sorted list, or reassembly
+        // would interleave two unrelated segments.
+        auto groupByPid = [](const std::vector<LicSeg>& segs) {
+            std::unordered_map<int, std::vector<size_t>> byPid;
+            for (size_t i = 0; i < segs.size(); ++i) byPid[segs[i].pid].push_back(i);
+            for (auto& kv : byPid)
+                std::sort(kv.second.begin(), kv.second.end(),
+                          [&](size_t a, size_t b){ return segs[a].sid < segs[b].sid; });
+            return byPid;
+        };
+        std::unordered_map<int, std::vector<size_t>> fwdByPid = groupByPid(fwdSegs);
+        std::unordered_map<int, std::vector<size_t>> bwdByPid = groupByPid(bwdSegs);
 
-        // 3) per pid: order by sid, concatenate (drop each later segment's first
-        //    point -- it repeats the previous segment's last), fold the whole line
-        std::vector<double> line;
+        std::vector<int> pids;
+        for (auto& kv : fwdByPid) pids.push_back(kv.first);
+        for (auto& kv : bwdByPid)
+            if (!fwdByPid.count(kv.first)) pids.push_back(kv.first);
+
+        // Per pid: build each direction's line separately (both start at the
+        // shared seed point), then stitch reversed-backward (far -> seed) +
+        // forward (seed -> far) so the LIC line runs through the seed, dropping
+        // the duplicated seed point at the join. Single-direction pids (only
+        // fwd or only bwd present) fold that one line as-is.
         long nLines = 0;
-        for (auto& kv : byPid) {
-            auto& idxs = kv.second;
-            std::sort(idxs.begin(), idxs.end(),
-                      [&](size_t a, size_t b){ return segs[a].sid < segs[b].sid; });
-            line.clear();
-            for (size_t k = 0; k < idxs.size(); ++k) {
-                const std::vector<double>& xyz = segs[idxs[k]].xyz;
-                const size_t startDbl = (k == 0) ? 0 : 3;   // skip 1 duplicated point
-                if (xyz.size() > startDbl)
-                    line.insert(line.end(), xyz.begin() + startDbl, xyz.end());
+        for (int pid : pids) {
+            std::vector<double> fwdLine, bwdLine;
+            auto fit = fwdByPid.find(pid);
+            if (fit != fwdByPid.end()) fwdLine = lic_build_line(fwdSegs, fit->second);
+            auto bit = bwdByPid.find(pid);
+            if (bit != bwdByPid.end()) bwdLine = lic_build_line(bwdSegs, bit->second);
+
+            std::vector<double> line;
+            if (!fwdLine.empty() && !bwdLine.empty()) {
+                const size_t n = bwdLine.size() / 3;
+                for (size_t i = 0; i < n; ++i)
+                    line.insert(line.end(), bwdLine.end() - 3 * (i + 1), bwdLine.end() - 3 * i);
+                line.insert(line.end(), fwdLine.begin() + 3, fwdLine.end());   // skip dup seed point
+            } else if (!fwdLine.empty()) {
+                line = std::move(fwdLine);
+            } else {
+                line = std::move(bwdLine);
             }
+
             if (!line.empty()) {
                 lic_add_streamline(run.img, line.data(), line.size() / 3);
                 ++nLines;
@@ -407,7 +448,7 @@ inline void lic_combine_finish(LicRun& run, const std::string& configPath,
         std::cerr << "[lic] reassembled + folded " << nLines << " whole streamlines on rank 0\n";
     }
 
-    lic_write_outputs(run, configPath, comm);   // no reduce: rank 0 has the full image
+    lic_write_outputs(run, configPath, fwdSegs, bwdSegs, comm);   // no reduce: rank 0 has it all
 }
 
 #endif // LIC_RENDER_HPP

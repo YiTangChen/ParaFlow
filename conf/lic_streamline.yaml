@@ -18,7 +18,7 @@ enable_timing: false
 outputDir: lic_output             # lic.png lands here
 
 maxsteps: 25000                    # RK4 steps per streamline, per direction (fwd + back)
-record_interval: 50               # ~50 stored points per streamline per direction
+record_interval: 50               # 25000/50 = ~500 stored points per streamline per direction
 dt: 60                            # fixed step (s)
 
 useGPU: false                     # CPU tracer
@@ -28,28 +28,11 @@ lic_height: 1024                  # override the seed-grid auto-size
 nproc: 8                          # MPI ranks; one block per rank
 nblocks: 8                        # one block per rank; must match graph.info.*.part.8
 
-# --- LIC folding strategy (A/B comparison) ---
-# false = fold each rank's per-block SEGMENTS locally, then reduce the images
-# true  = rank 0 reads the <gid>.bin files, reassembles WHOLE streamlines
-#         (scripts/plot/read_traces.py logic), and folds those.
-#         NOTE: <gid>.bin keeps only the LAST direction, so for combine use
-#         lic_direction: forward (or backward), not both.
-lic_combine: false
-
 # --- Where the streamlines live: memory or storage ---------------------------
-#   memory = traces are folded straight out of RAM and freed right after (one
-#            direction at a time), and the per-block <gid>.bin files are DELETED
-#            as soon as the run finishes. The only artifact left is lic.png.
-#   disk   = the <gid>.bin files are KEPT (moved into the run folder
-#            <outputDir>/<mode>_<dir>_<data>/) so the raw trajectories can be
-#            reused later (scripts/plot/read_traces.py, plotting, ...).
-#
-# NOTE: ParaFlow::GenStreamLines always writes <gid>.bin while it fills the
-# in-memory list (block.hpp write_trajectory does both in one pass), so `memory`
-# cannot skip that transient write -- it guarantees the files are GONE afterwards.
-# To keep even the transient write off real disk, point outputDir at a tmpfs (RAM)
-# path, e.g.  outputDir: /dev/shm/lic_run   (then copy lic.png out afterwards).
-#
+# Segments are gathered to rank 0 over MPI -- no rank writes a .bin during tracing.
+#   memory = segments dropped once folded; only lic.png is left.
+#   disk   = rank 0 writes them as <gid>.bin in <outputDir>/<mode>_<dir>_<data>/
+#            for later reuse (scripts/plot/read_traces.py, ...).
 # Supersedes the old boolean `keep_streamline_bin` (still honored if this is absent).
 streamline_storage: memory        # memory | disk
 
