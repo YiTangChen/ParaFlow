@@ -247,7 +247,24 @@ def extract_n_blocks_n_seeds(path: str):
     m = re.match(r"b(\d+)_s(\d+)_run(\d+)", name)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+    # NERSC strong-scaling logs use names such as
+    # ss_highres_128_gpu_10k_2015_2017_<jobid>.err.
+    m = re.search(r"(?:^|_)highres_(\d+)_(?:cpu|gpu)_(\d+)k(?:_|$)", name)
+    if m:
+        return int(m.group(1)), int(m.group(2)) * 1000, 1
+
     return None, None, None
+
+
+def infer_mesh(path: str) -> str:
+    """Infer mesh metadata from the log filename; retain lowres as the legacy fallback."""
+    name = Path(path).name.lower()
+    if "highres" in name:
+        return "highres"
+    if "lowres" in name:
+        return "lowres"
+    return "lowres"
 
 
 def parse_log(path: str):
@@ -869,7 +886,7 @@ def main():
         global_data, blocks, has_gpu = parse_log(path)
 
         device = override_device if override_device else ("gpu" if has_gpu else "cpu")
-        mesh = override_mesh if override_mesh else "lowres"
+        mesh = override_mesh if override_mesh else infer_mesh(path)
 
         summary_row = build_summary_row(n_blocks, n_seeds, run_id, device, mesh, global_data, blocks)
         block_rows = build_block_rows(n_blocks, n_seeds, run_id, device, mesh, blocks)
