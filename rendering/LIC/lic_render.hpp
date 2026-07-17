@@ -246,9 +246,17 @@ inline void lic_parse_segments(const char* data, size_t len, std::vector<LicSeg>
     }
 }
 
-// MPI-gather one direction's segments (already serialized locally by
-// GenStreamLines's segBytesOut) straight to rank 0 and parse them there -- no
-// rank ever writes a file. `out` is only populated on rank 0.
+// Gather one direction's segments (already serialized locally by
+// GenStreamLines's segBytesOut) to rank 0 and parse them there -- no rank ever
+// writes a file. `out` is only populated on rank 0.
+//
+// Rank 0 pulls each rank's buffer in turn (point-to-point) rather than one big
+// MPI_Gatherv: at ~1M seeds the total is tens of GB, which overflows the int
+// counts/displacements MPI_Gatherv (and a single int offset) require. Sizes are
+// carried as uint64 and each payload is sent in <2GB chunks so no MPI count or
+// buffer offset ever exceeds INT_MAX. Rank 0 still holds all parsed segments in
+// RAM (that's the point of streamline_storage: memory); only the transfer is
+// chunked.
 inline void lic_gather_segments(const std::vector<char>& localBytes,
                                 std::vector<LicSeg>& out,
                                 MPI_Comm comm = MPI_COMM_WORLD)
@@ -257,25 +265,31 @@ inline void lic_gather_segments(const std::vector<char>& localBytes,
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &nranks);
 
-    const int localSize = (int)localBytes.size();
-    std::vector<int> sizes(rank == 0 ? nranks : 0);
-    MPI_Gather(&localSize, 1, MPI_INT, sizes.data(), 1, MPI_INT, 0, comm);
+    const int TAG_SIZE = 0x11C, TAG_DATA = 0x11D;
+    const size_t CHUNK = (size_t)256 * 1024 * 1024;   // 256 MB per MPI message
 
-    std::vector<int> displs;
-    std::vector<char> allBytes;
-    if (rank == 0) {
-        displs.resize(nranks);
-        int total = 0;
-        for (int r = 0; r < nranks; ++r) { displs[r] = total; total += sizes[r]; }
-        allBytes.resize(total);
+    if (rank != 0) {
+        uint64_t n = localBytes.size();
+        MPI_Send(&n, 1, MPI_UINT64_T, 0, TAG_SIZE, comm);
+        for (uint64_t off = 0; off < n; off += CHUNK) {
+            int len = (int)std::min(CHUNK, (size_t)(n - off));
+            MPI_Send(localBytes.data() + off, len, MPI_CHAR, 0, TAG_DATA, comm);
+        }
+        return;
     }
-    MPI_Gatherv(localBytes.data(), localSize, MPI_CHAR,
-                rank == 0 ? allBytes.data() : nullptr,
-                rank == 0 ? sizes.data()    : nullptr,
-                rank == 0 ? displs.data()   : nullptr,
-                MPI_CHAR, 0, comm);
 
-    if (rank == 0) lic_parse_segments(allBytes.data(), allBytes.size(), out);
+    lic_parse_segments(localBytes.data(), localBytes.size(), out);   // rank 0's own
+    std::vector<char> buf;
+    for (int r = 1; r < nranks; ++r) {
+        uint64_t n = 0;
+        MPI_Recv(&n, 1, MPI_UINT64_T, r, TAG_SIZE, comm, MPI_STATUS_IGNORE);
+        buf.resize(n);
+        for (uint64_t off = 0; off < n; off += CHUNK) {
+            int len = (int)std::min(CHUNK, (size_t)(n - off));
+            MPI_Recv(buf.data() + off, len, MPI_CHAR, r, TAG_DATA, comm, MPI_STATUS_IGNORE);
+        }
+        lic_parse_segments(buf.data(), n, out);
+    }
 }
 
 // Rank-0 output step: create <outputDir>/<mode>_<direction>_<datafile>/, write

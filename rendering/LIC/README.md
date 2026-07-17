@@ -28,13 +28,16 @@ for **OSC Cardinal**.
 ### OSC Cardinal (MVAPICH + spack NetCDF)
 
 ```bash
+module load cuda/12.4.1
 export LD_LIBRARY_PATH=/apps/spack/0.21/cardinal/linux-rhel9-sapphirerapids/netcdf-cxx4/gcc/12.3.0/mvapich/3.0/4.3.1-tgr36hp/lib64:${LD_LIBRARY_PATH}
 srun -n <nproc> --ntasks-per-node=4 --gpus-per-task=1 --mpi=pmi2 \
   ./ParaFlow_lic_gpu conf/lic_streamline_gpu.yaml
 ```
 
+The CUDA module supplies `libcudart.so.12` at runtime; without it the binary
+dies with `error while loading shared libraries: libcudart.so.12`.
 `LD_LIBRARY_PATH` is required (`build_lic_gpu.sh` links `libnetcdf-cxx4.so` with
-no rpath; `jobs/osc_lic_batch_gpu.sh` already sets it). `<nproc>` must match
+no rpath; `jobs/osc_lic_batch_gpu.sh` already sets both). `<nproc>` must match
 `nproc`/`nblocks` in the config. `--mpi=pmi2` is required — this binary links
 Slurm's PMI client, not `libpmix` (confirm with `ldd ./ParaFlow_lic_gpu | grep
 pmi`); with `--mpi=pmix` every rank becomes a singleton `rank=0 size=1` world
