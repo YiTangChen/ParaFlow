@@ -147,3 +147,21 @@ jobs/plot_traces.sh   # reassemble per-rank output + render it on the ocean mask
 
 `plot_traces.sh` plots **pathlines** by default; to plot **streamlines**, swap the two
 commented lines at the top of the script (point it at `streamlines/` instead of `pathlines/`).
+
+## Interactive 3D viewer
+
+`rendering/opengl/earth_pathline_opengl.py` opens an interactive window and renders
+pathlines as depth-coloured head+tail particles animating over a texture-mapped ocean
+globe — rotate/zoom/pan with the mouse, watch trails fade over a configurable window,
+and scrub through the simulation instead of exporting a video.
+
+<img src="scripts/plot/MPASO-earth.png" alt="Interactive pathline viewer — MPAS-O Earth" width="50%">
+
+
+```bash
+python rendering/opengl/earth_pathline_opengl.py <pathlines.bin> <mesh.nc> --interactive
+```
+
+The same script also renders a static PNG preview (`--final` for a full-trajectory
+summary image) or stitches an MP4 animation when neither `--interactive` nor `--final`
+is given.
