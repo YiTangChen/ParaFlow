@@ -723,7 +723,8 @@ bool ParaFlow::trace_block_iexchange(Block*                              b,
     return true;
 }
 
-void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
+void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines, double dt_sign, bool writeToDisk,
+                              std::vector<char>* segBytesOut)
 {
     diy::ContiguousAssigner   assigner(this->size, this->nblocks);
     int rank = world.rank();
@@ -747,6 +748,11 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
         if (enable_timing) { load_timing::g.enabled = true; load_timing::g.reset(); }
         double _t_load = pf_now(enable_timing);
         b->set_data(gid, this->meshFile.c_str(), this->vectorFiles[0].c_str(), this->seeds, this->areaIndices, this->cfg);
+        // Direction control (same method, opposite integration sign). set_data set
+        // integrationDt = cfg.dt (> 0); dt_sign = -1 integrates the identical RK4 +
+        // cross-block handoff backward from each seed. dt_sign = +1 leaves it as-is,
+        // so existing callers (ParaFlow_streamline) are unaffected.
+        if (dt_sign < 0.0) b->integrationDt = -b->integrationDt;
         pf_accum(b->timing.t_block_load, _t_load, enable_timing);
         if (enable_timing) {
             b->timing.n_seeds_initial      = (int)b->currentSeeds.size();
@@ -801,10 +807,16 @@ void ParaFlow::GenStreamLines(std::list<std::vector<VECTOR3>>& streamlines)
     for (size_t i = 0; i < gids.size(); ++i)   // for the local blocks in this processor
     {
         int gid = gids[i];
-        std::string filename = this->outputDir + "/" + std::to_string(gid) + ".bin";
+        // dt_sign < 0 (backward pass) gets its own file so a forward+backward
+        // pair with writeToDisk=true doesn't have the second write clobber the
+        // first. Forward keeps the plain name so single-direction callers
+        // (ParaFlow_streamline) are unaffected.
+        std::string filename = this->outputDir + "/" + std::to_string(gid)
+                              + (dt_sign < 0.0 ? "_bwd" : "") + ".bin";
         double _t_write = pf_now(enable_timing);
         Block* blk = (Block*)master.block(master.lid(gid));
-        blk->write_trajectory(filename, streamlines, this->interval);
+        blk->write_trajectory(filename, streamlines, this->interval, writeToDisk);
+        if (segBytesOut) blk->append_trajectory_bytes(*segBytesOut);
         pf_accum(blk->timing.t_output_write, _t_write, enable_timing);
     }
 

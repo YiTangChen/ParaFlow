@@ -1,0 +1,22 @@
+# lic_batch_gpu.yaml — manifest of per-dataset LIC configs to run one after
+# another in a single job. Each entry is a normal ParaFlow_lic_gpu config
+# (copy conf/lic_streamline_gpu.yaml and only change datafile_src/meshfile_src
+# per dataset — outputDir + the run label already keyed on the dataset
+# filename, so separate configs never overwrite each other's lic.png).
+#
+# Run with: bash jobs/osc_lic_batch_gpu.sh conf/lic_batch_gpu.yaml
+# (inside a salloc, same as a single lic_streamline_gpu.yaml run)
+
+configs:
+  - conf/lic_gpu_0016-01-01.yaml
+  - conf/lic_gpu_0016-02-01.yaml
+  - conf/lic_gpu_0016-03-01.yaml
+  - conf/lic_gpu_0016-04-01.yaml
+  - conf/lic_gpu_0016-05-01.yaml
+  - conf/lic_gpu_0016-06-01.yaml
+  - conf/lic_gpu_0016-07-01.yaml
+  - conf/lic_gpu_0016-08-01.yaml
+  - conf/lic_gpu_0016-09-01.yaml
+  - conf/lic_gpu_0016-10-01.yaml
+  - conf/lic_gpu_0016-11-01.yaml
+  - conf/lic_gpu_0016-12-01.yaml
